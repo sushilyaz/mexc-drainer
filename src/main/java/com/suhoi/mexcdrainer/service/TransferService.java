@@ -94,13 +94,17 @@ public class TransferService {
                         .build());
                 log.info("✅ A: MARKET BUY исполнен, orderId={}", r1.getOrderId());
 
-                // обновим баланс A
-                accA = mexc.account(a.getApiKey(), a.getSecret());
-                aBase = free(accA, base);
+                // обновим баланс A — ждём, пока баланс действительно обновится
+                log.info("⏳ Жду обновления баланса {} на A после MARKET BUY (до порога шага {}) ...", base, baseStep);
+                aBase = waitBaseAfterTrade(a.getApiKey(), a.getSecret(), base, baseStep, 10); // до 10 попыток
+
                 if (aBase.compareTo(baseStep) < 0) {
-                    log.info("⛔ После покупки на A {} слишком мало для ордера: {} (шаг {})", base, aBase, baseStep);
+                    log.info("⛔ После покупки на A слишком мало {}: {} (шаг {}). Скорее всего покупка была мала по нотионалу или ещё не зачислена.",
+                            base, aBase, baseStep);
+                    // Можно попробовать ещё один цикл, но безопаснее выйти:
                     break;
                 }
+
             } else {
                 log.info("♻️ На A уже есть валидный остаток {}={} (step={}, notional@bid={}). Начинаю с SELL внутри спреда.",
                         base, aBase, baseStep, bestBid0.multiply(aBase));
@@ -248,45 +252,59 @@ public class TransferService {
 
     // ===================== ПОСТАНОВКА И ПЕРЕСТАНОВКА ВНУТРИ СПРЕДА =====================
 
+    /**
+     * Ставит лимитку ВНУТРИ СПРЕДА и следит: если на нашем уровне появился чужой объём,
+     * двигаем цену к центру спреда (SELL – вверх, BUY – вниз), оставаясь внутри допустимого диапазона.
+     * «Уникальность» уровня = объём уровня ровно равен моему неисполненному остатку.
+     * ВАЖНО: при перестановке продаём/покупаем ИМЕННО ОСТАТОК (myRemain), чтобы не ловить Oversold/Insufficient.
+     */
     private OrderResponse placeUniqueLimitInsideSpread(
             String apiKey, String secret, String symbol, String side,
-            BigDecimal qty, int qtyScaleForThisQty, InsidePlan plan, int priceScale, boolean askSide) {
+            BigDecimal qty, int qtyScale, InsidePlan plan, int priceScale, boolean askSide) {
 
         int reposts = 0;
         BigDecimal currentPrice = plan.startPrice;
+        BigDecimal currentQty   = qty;           // <- текущее количество, будем обновлять до остатка
+        int currentQtyScale     = qtyScale;      // <- и масштаб под него
 
         while (true) {
-            // ЛОГ до отправки
-            BigDecimal reqQuoteLog = askSide ? BigDecimal.ZERO
-                    : currentPrice.multiply(qty).setScale(priceScale, RoundingMode.DOWN);
-            log.info("➡️ Перед отправкой {}(inside): qty={} по цене {}. Требуется ≈ {} {}",
-                    side, qty, currentPrice, reqQuoteLog, askSide ? "" : "USDT");
+            // Лог ДО отправки ордера
+            BigDecimal reqQuoteLog = currentPrice.multiply(currentQty).setScale(priceScale, RoundingMode.DOWN);
+            log.info("➡️ Перед отправкой {}(inside): qty={} по цене {}. Требуется ≈ {} USDT",
+                    side, currentQty, currentPrice, reqQuoteLog);
 
+            // Ставим ордер с ТЕКУЩИМ количеством
             OrderResponse placed = mexc.newOrder(apiKey, secret, NewOrderRequest.builder()
                     .symbol(symbol).side(side).type("LIMIT")
-                    .quantity(fmt(qty, qtyScaleForThisQty))
+                    .quantity(fmt(currentQty, currentQtyScale))
                     .price(fmt(currentPrice, priceScale))
                     .newClientOrderId(side.charAt(0) + "_LIM_" + System.currentTimeMillis())
                     .build());
             String orderId = placed.getOrderId();
 
-            log.info("📌 {}(inside): поставил лимитку orderId={} qty={} по цене {}", side, orderId, qty, currentPrice);
+            log.info("📌 {}(inside): поставил лимитку orderId={} qty={} по цене {}", side, orderId, currentQty, currentPrice);
 
-            // Мониторинг «только мой»
+            // Мониторим до уникальности уровня, иначе — переставляем
             while (true) {
                 try { Thread.sleep(props.getMexc().getPollMs()); } catch (InterruptedException ignored) {}
 
+                // Ещё открыт?
                 var openOpt = mexc.openOrders(apiKey, secret, symbol).stream()
                         .filter(o -> orderId.equals(o.getOrderId()))
                         .findFirst();
+
                 if (openOpt.isEmpty()) {
-                    log.info("✅ Лимитка orderId={} исполнилась/снята — продолжаю", orderId);
+                    log.info("✅ Лимитка orderId={} исполнилась/снята — продолжаю флоу", orderId);
                     return placed;
                 }
 
                 OpenOrder open = openOpt.get();
-                BigDecimal myRemain = parseOrZero(open.getOrigQty()).subtract(parseOrZero(open.getExecutedQty()));
+                BigDecimal orig = parseOrZero(open.getOrigQty());
+                BigDecimal exec = parseOrZero(open.getExecutedQty());
+                BigDecimal myRemain = orig.subtract(exec);
+                if (myRemain.compareTo(BigDecimal.ZERO) < 0) myRemain = BigDecimal.ZERO;
 
+                // Текущая глубина и объём на нашем уровне
                 Depth d = mexc.depth(symbol, 20);
                 BigDecimal levelQty = side.equals("SELL")
                         ? levelQty(d.getAsks(), currentPrice)
@@ -298,7 +316,7 @@ public class TransferService {
                     return placed;
                 }
 
-                // Подсадка — двигаем к центру
+                // --- КТО-ТО ПОДСЕЛ → переставляем к центру И на остаток ---
                 BookTicker t = mexc.bookTicker(symbol);
                 BigDecimal bid = parseOrZero(t.getBidPrice());
                 BigDecimal ask = parseOrZero(t.getAskPrice());
@@ -307,34 +325,53 @@ public class TransferService {
                 BigDecimal minInside = bid.add(tick).setScale(priceScale, RoundingMode.DOWN);
                 BigDecimal maxInside = ask.subtract(tick).setScale(priceScale, RoundingMode.DOWN);
                 if (maxInside.compareTo(minInside) < 0) {
-                    if (askSide) { maxInside = ask; minInside = bid.add(tick).min(maxInside); }
-                    else { minInside = bid; maxInside = ask.subtract(tick).max(minInside); }
+                    if (askSide) { // SELL – позволяем стать прямо на ask
+                        maxInside = ask;
+                        minInside = bid.add(tick).min(maxInside);
+                    } else {       // BUY – позволяем стать прямо на bid
+                        minInside = bid;
+                        maxInside = ask.subtract(tick).max(minInside);
+                    }
                 }
 
-                BigDecimal next = askSide ? currentPrice.add(tick) : currentPrice.subtract(tick);
-                if (next.compareTo(minInside) < 0) next = minInside;
-                if (next.compareTo(maxInside) > 0) next = maxInside;
+                BigDecimal nextPrice = askSide ? currentPrice.add(tick) : currentPrice.subtract(tick);
+                if (nextPrice.compareTo(minInside) < 0) nextPrice = minInside;
+                if (nextPrice.compareTo(maxInside) > 0) nextPrice = maxInside;
 
-                if (next.compareTo(currentPrice) == 0) {
-                    log.info("ℹ️ Нет возможности переставить {} внутри спреда (граница). Оставляю {}.", side, currentPrice);
+                if (nextPrice.compareTo(currentPrice) == 0) {
+                    log.info("ℹ️ Нет возможности переставить {} внутри спреда (упёрлись в границу). Оставляю цену {}.",
+                            side, currentPrice);
                     return placed;
                 }
 
-                log.info("⚠️ {}: на уровне {} подсадили чужой объём (уровень={}, мой остаток={}). Переставляю: {} → {}",
-                        side, currentPrice, levelQty, myRemain, currentPrice, next);
+                // ВАЖНО: обновляем количество на ОСТАТОК до отмены
+                BigDecimal newQty = myRemain.stripTrailingZeros();
+                if (newQty.compareTo(BigDecimal.ZERO) <= 0) {
+                    log.info("ℹ️ Остаток по ордеру стал 0 — переставлять нечего. Оставляю как есть.");
+                    return placed;
+                }
+                int newQtyScale = qtyToScale(newQty);
 
+                log.info("⚠️ {}: на уровне {} подсадили чужой объём (уровень={}, мой остаток={}). Переставляю: " +
+                                "цена {} → {}, количество {} → {}",
+                        side, currentPrice, levelQty, myRemain, currentPrice, nextPrice, currentQty, newQty);
+
+                // Снимаем старый, обновляем таргеты и переходим на новый круг (поставим заново)
                 mexc.cancelOrder(apiKey, secret, symbol, orderId);
-                currentPrice = next;
-                reposts++;
+                currentPrice    = nextPrice;
+                currentQty      = newQty;
+                currentQtyScale = newQtyScale;
 
+                reposts++;
                 if (reposts > props.getMexc().getMaxReposts()) {
                     throw new IllegalStateException("Слишком много перестановок по " + side + " " + symbol);
                 }
 
-                break; // снова поставим и продолжим мониторинг
+                break; // наружный цикл снова поставит ордер с обновлёнными price/qty
             }
         }
     }
+
 
     // ===================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =====================
 
@@ -381,6 +418,31 @@ public class TransferService {
                 })
                 .orElse(BigDecimal.ZERO);
     }
+
+    /**
+     * Ждёт обновления свободного баланса базового актива после сделки.
+     * Пуллит /account до тех пор, пока free(asset) >= threshold (обычно = шаг qty) или не исчерпает попытки.
+     */
+    private BigDecimal waitBaseAfterTrade(String apiKey, String secret, String asset,
+                                          BigDecimal threshold, int maxAttempts) {
+        BigDecimal last = BigDecimal.ZERO;
+        for (int i = 1; i <= Math.max(1, maxAttempts); i++) {
+            try { Thread.sleep(props.getMexc().getPollMs()); } catch (InterruptedException ignored) {}
+            AccountInfo acc = mexc.account(apiKey, secret);
+            BigDecimal cur = free(acc, asset);
+            log.info("⏳ Проверка баланса {} после сделки (попытка {}/{}): {}", asset, i, maxAttempts, cur);
+            // если выросло относительно прошлого чтения — это признак, что апдейт дошёл
+            if (cur.compareTo(threshold) >= 0 || cur.compareTo(last) > 0) {
+                last = cur;
+                // если уже >= порога — выходим сразу
+                if (cur.compareTo(threshold) >= 0) return cur;
+            } else {
+                last = cur;
+            }
+        }
+        return last; // вернём, что получилось (даже если < threshold)
+    }
+
 
     private static BigDecimal fitQtyUnderQuote(BigDecimal quoteFree, BigDecimal price, BigDecimal qty,
                                                BigDecimal step, int quoteScale) {
