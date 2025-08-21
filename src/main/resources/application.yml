@@ -1,0 +1,15 @@
+server:
+  port: 8080
+
+app:
+  telegram:
+    botToken: 8013267846:AAFRYVCj2Et9cRZZmKdxjq7JhnzG8O82mck
+    botUsername: drain_mexc_bot
+  mexc:
+    baseUrl: https://api.mexc.com
+    recvWindowMs: 5000
+    pollMs: 600
+    maxReposts: 12
+    maxCycles: 100
+    takerFeePct: 0.0005
+    safetySpendPct: 0.998
