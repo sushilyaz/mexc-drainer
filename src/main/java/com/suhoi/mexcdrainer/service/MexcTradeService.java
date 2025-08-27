@@ -133,6 +133,13 @@ public class MexcTradeService {
         return getAssetBalance(creds.getApiKey(), creds.getSecret(), asset);
     }
 
+    public BigDecimal getTokenBalanceAccountB(String symbol, Long chatId) {
+        var creds = MemoryDb.getAccountB(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
+        String asset = symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4) : symbol;
+        return getAssetBalance(creds.getApiKey(), creds.getSecret(), asset);
+    }
+
     private BigDecimal getAssetBalance(String apiKey, String secretKey, String asset) {
         Map<String, String> params = new LinkedHashMap<>();
         JsonNode resp = signedRequest("GET", ACCOUNT_ENDPOINT, params, apiKey, secretKey);
@@ -189,7 +196,7 @@ public class MexcTradeService {
         params.put("side", "SELL");
         params.put("type", "LIMIT");
         params.put("timeInForce", "GTC");
-        params.put("quantity", qty.setScale(18, RoundingMode.DOWN).toPlainString());
+        params.put("quantity", qty.setScale(5, RoundingMode.DOWN).toPlainString());
         params.put("price", price.stripTrailingZeros().toPlainString());
 
         JsonNode resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
@@ -218,7 +225,7 @@ public class MexcTradeService {
         params.put("side", "BUY");
         params.put("type", "LIMIT");
         params.put("timeInForce", "GTC");
-        params.put("quantity", qty.setScale(18, RoundingMode.DOWN).toPlainString());
+        params.put("quantity", qty.setScale(5, RoundingMode.DOWN).toPlainString());
         params.put("price", price.stripTrailingZeros().toPlainString());
 
         JsonNode resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
@@ -233,33 +240,79 @@ public class MexcTradeService {
         params.put("side", side);
         params.put("type", "LIMIT");
         params.put("timeInForce", "GTC");
-        params.put("quantity", qty.setScale(18, RoundingMode.DOWN).toPlainString());
+        params.put("quantity", qty.setScale(5, RoundingMode.DOWN).toPlainString());
         params.put("price", price.stripTrailingZeros().toPlainString());
 
         signedRequest("POST", ORDER_ENDPOINT, params, apiKey, secret);
     }
 
-    public void buyFromAccountB(String symbol, BigDecimal price, BigDecimal qty, Long chatId) {
-        var creds = MemoryDb.getAccountB(chatId);
-        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
-        placeLimitOrder(symbol, "BUY", price, qty, creds.getApiKey(), creds.getSecret());
-    }
-
-    public void sellFromAccountB(String symbol, BigDecimal price, BigDecimal usdtAmount, Long chatId) {
+    public void marketBuyFromAccountB(String symbol, BigDecimal price, BigDecimal qty, Long chatId) {
         var creds = MemoryDb.getAccountB(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
 
-        BigDecimal qty = BigDecimal.ZERO;
+        // сколько примерно нужно USDT чтобы купить qty токенов
+        BigDecimal requiredUsdt = BigDecimal.ZERO;
         try {
-            qty = usdtAmount.divide(price, 8, RoundingMode.DOWN);
-        } catch (ArithmeticException ex) {
-            qty = BigDecimal.ZERO;
+            requiredUsdt = price.multiply(qty).setScale(5, RoundingMode.UP);
+        } catch (Exception ex) {
+            log.warn("Ошибка расчёта requiredUsdt: {}", ex.getMessage(), ex);
         }
-        if (qty.compareTo(BigDecimal.ZERO) <= 0) {
-            log.warn("sellFromAccountB: calculated qty <= 0 (usdt={}, price={})", usdtAmount, price);
+
+        // сколько реально есть USDT на аккаунте B
+        BigDecimal availableUsdt = getAssetBalance(creds.getApiKey(), creds.getSecret(), "USDT");
+        if (availableUsdt.compareTo(BigDecimal.ZERO) <= 0) {
+            log.warn("B не имеет USDT для покупки (available=0)");
             return;
         }
-        placeLimitOrder(symbol, "SELL", price, qty, creds.getApiKey(), creds.getSecret());
+
+        // если мало USDT — уменьшаем qty до максимально возможного
+        if (availableUsdt.compareTo(requiredUsdt) < 0) {
+            BigDecimal adjustedQty = availableUsdt.divide(price, 8, RoundingMode.DOWN);
+            if (adjustedQty.compareTo(BigDecimal.ZERO) <= 0) {
+                log.warn("B недостаточно USDT ({}) чтобы купить хоть немного токенов по цене {}", availableUsdt, price);
+                return;
+            }
+            log.info("B имеет меньше USDT ({}) чем нужно ({}). Уменьшаем qty -> {}", availableUsdt, requiredUsdt, adjustedQty);
+            qty = adjustedQty;
+            requiredUsdt = availableUsdt;
+        }
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "BUY");
+        params.put("type", "MARKET");
+        // для MARKET BUY используем quoteOrderQty (сколько USDT потратить)
+        params.put("quoteOrderQty", requiredUsdt.toPlainString());
+
+        signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
+    }
+
+    // Исправленный marketSellFromAccountB — продаёт qty токенов (если B имеет меньше — уменьшаем qty).
+    public void marketSellFromAccountB(String symbol, BigDecimal price, BigDecimal qty, Long chatId) {
+        var creds = MemoryDb.getAccountB(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
+
+        String asset = symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4) : symbol;
+        BigDecimal availableTokens = getAssetBalance(creds.getApiKey(), creds.getSecret(), asset);
+
+        if (availableTokens.compareTo(BigDecimal.ZERO) <= 0) {
+            log.warn("B не имеет токенов {} для продажи (available=0)", asset);
+            return;
+        }
+
+        if (availableTokens.compareTo(qty) < 0) {
+            log.info("B имеет меньше токенов ({}) чем требуется ({}). Уменьшаем qty -> {}", availableTokens, qty, availableTokens);
+            qty = availableTokens;
+        }
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "SELL");
+        params.put("type", "MARKET");
+        // для MARKET SELL указываем quantity (количество базовых токенов)
+        params.put("quantity", qty.setScale(5, RoundingMode.DOWN).toPlainString());
+
+        signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
     }
 
     public void forceMarketSellAccountA(String symbol, BigDecimal qty, Long chatId) {
@@ -270,7 +323,7 @@ public class MexcTradeService {
         params.put("symbol", symbol);
         params.put("side", "SELL");
         params.put("type", "MARKET");
-        params.put("quantity", qty.setScale(18, RoundingMode.DOWN).toPlainString());
+        params.put("quantity", qty.setScale(5, RoundingMode.DOWN).toPlainString());
 
         signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
     }
@@ -285,7 +338,7 @@ public class MexcTradeService {
             BigDecimal bid = new BigDecimal(resp.get("bidPrice").asText());
             BigDecimal ask = new BigDecimal(resp.get("askPrice").asText());
             BigDecimal spread = ask.subtract(bid);
-            return bid.add(spread.multiply(BigDecimal.valueOf(0.1))).setScale(18, RoundingMode.HALF_UP);
+            return bid.add(spread.multiply(BigDecimal.valueOf(0.1))).setScale(5, RoundingMode.HALF_UP);
         } catch (Exception e) {
             log.error("Ошибка получения стакана: {}", e.getMessage(), e);
             throw new RuntimeException(e);
@@ -300,7 +353,7 @@ public class MexcTradeService {
             BigDecimal bid = new BigDecimal(resp.get("bidPrice").asText());
             BigDecimal ask = new BigDecimal(resp.get("askPrice").asText());
             BigDecimal spread = ask.subtract(bid);
-            return ask.subtract(spread.multiply(BigDecimal.valueOf(0.1))).setScale(18, RoundingMode.HALF_UP);
+            return ask.subtract(spread.multiply(BigDecimal.valueOf(0.1))).setScale(5, RoundingMode.HALF_UP);
         } catch (Exception e) {
             log.error("Ошибка получения стакана: {}", e.getMessage(), e);
             throw new RuntimeException(e);
@@ -324,7 +377,7 @@ public class MexcTradeService {
         return null;
     }
 
-    private JsonNode signedRequestTest(String method, String path, Map<String,String> params, String apiKey, String secret) {
+    private JsonNode signedRequestTest(String method, String path, Map<String, String> params, String apiKey, String secret) {
         try {
             if (params == null) params = new LinkedHashMap<>();
             params.put("timestamp", String.valueOf(getServerTime()));

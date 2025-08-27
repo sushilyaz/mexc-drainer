@@ -5,6 +5,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 
 /**
  * Сервис перелива USDT между двумя аккаунтами через монету с большим спредом.
@@ -23,41 +24,31 @@ public class DrainService {
      * @param usdtAmount сумма в USDT для перелива
      * @param chatId     id чата Телеграма для обратной связи
      */
-    public void startDrain(String symbol, BigDecimal usdtAmount, Long chatId) {
-        log.info("🚀 Запуск перелива: символ={}, сумма={} USDT", symbol, usdtAmount);
-
+    public void startDrain(String symbol, BigDecimal usdtAmount, Long chatId, int cycles) {
         try {
-            // Проверка средств
-            if (!mexcTradeService.checkBalances(usdtAmount, chatId)) {
-                log.warn("❌ Недостаточно средств на аккаунтах для перелива {} USDT", usdtAmount);
-                return;
+            log.info("🚀 Запуск перелива: символ={}, сумма={} USDT", symbol, usdtAmount);
+
+            // 1️⃣ На A покупаем токены на usdtAmount
+            mexcTradeService.marketBuyAccountA(symbol, usdtAmount, chatId);
+            // Получаем сколько реально купили токенов
+            BigDecimal qtyTokens = mexcTradeService.getTokenBalanceAccountA(symbol, chatId);
+            log.info("A ➡ Купил на {} USDT, получил {} токенов", usdtAmount, qtyTokens);
+
+            // 2️⃣ Крутим цикл несколько раз
+            for (int i = 0; i < cycles; i++) {
+                log.info("🔄 Цикл {}/{}", i + 1, cycles);
+                executeCycle(symbol, qtyTokens, chatId);
+
+                // можно уточнять qtyTokens каждый раз с биржи, чтобы не накапливалась погрешность
+                qtyTokens = mexcTradeService.getTokenBalanceAccountB(symbol, chatId);
+                if (qtyTokens.compareTo(BigDecimal.ZERO) <= 0) {
+                    log.warn("⚠ У B закончились токены, прерываем перелив");
+                    break;
+                }
             }
-
-            // Первый шаг — покупка по рынку
-            String orderIdA = mexcTradeService.marketBuyAccountA(symbol, usdtAmount, chatId);
-            log.info("✅ Аккаунт A купил по рынку {} на {} USDT, ордер={}", symbol, usdtAmount, orderIdA);
-
-            // Получаем реальное количество токенов на A (уже с учётом комиссии)
-            BigDecimal tokensA = mexcTradeService.getTokenBalanceAccountA(symbol, chatId);
-            log.info("📊 Баланс токенов на A после покупки: {}", tokensA);
-
-            int cycle = 1;
-            while (tokensA.compareTo(BigDecimal.ZERO) > 0) {
-                log.info("🔄 Запуск цикла {} ({} токенов)", cycle, tokensA);
-                executeCycle(symbol, tokensA, chatId);
-
-                // Обновляем баланс после цикла
-                tokensA = mexcTradeService.getTokenBalanceAccountA(symbol, chatId);
-                log.info("📊 Новый баланс токенов на A: {}", tokensA);
-
-                cycle++;
-            }
-
-            BigDecimal finalUsdt = mexcTradeService.getUsdtBalanceAccountA(chatId);
-            log.info("✅ Перелив завершён. Итоговый баланс на A ≈ {} USDT", finalUsdt);
 
         } catch (Exception e) {
-            log.error("❌ Ошибка при выполнении перелива", e);
+            log.error("❌ Ошибка в startDrain", e);
         }
     }
 
@@ -65,42 +56,35 @@ public class DrainService {
      * Один цикл перелива (с реальными балансами)
      *
      * @param symbol   тикер
-     * @param qty      количество токенов на аккаунте A
      * @param chatId   id чата
      */
-    private void executeCycle(String symbol, BigDecimal qty, Long chatId) {
+    private void executeCycle(String symbol, BigDecimal qtyTokens, Long chatId) {
         try {
-            // Лимитка на продажу (A)
+            // 1️⃣ A продает лимиткой
             BigDecimal sellPrice = mexcTradeService.getNearLowerSpreadPrice(symbol);
-            String limitSellOrderId = mexcTradeService.placeLimitSellAccountA(symbol, sellPrice, qty, chatId);
-            log.info("A ➡ Продажа лимиткой: {} @ {}, ордер={}", qty, sellPrice, limitSellOrderId);
+            mexcTradeService.placeLimitSellAccountA(symbol, sellPrice, qtyTokens, chatId);
+            log.info("A ➡ Выставил лимитный ордер на продажу на сумму {} токенов по цене {}", qtyTokens, sellPrice);
 
-            // B выкупает
-            mexcTradeService.buyFromAccountB(symbol, sellPrice, qty, chatId);
-            log.info("B ➡ Купил {} @ {}", qty, sellPrice);
+            // 2️⃣ B покупает ровно столько же
+            mexcTradeService.marketBuyFromAccountB(symbol, sellPrice, qtyTokens, chatId);
+            log.info("B ➡ Купил по рынку {} токенов @ {}", qtyTokens, sellPrice);
 
-            // Теперь у A USDT, проверяем баланс
-            BigDecimal usdtA = mexcTradeService.getUsdtBalanceAccountA(chatId);
-            log.info("📊 Баланс USDT на A после продажи: {}", usdtA);
+            // 3️⃣ Считаем сколько USDT имеет A
+            BigDecimal usdtEarned = sellPrice.multiply(qtyTokens).setScale(5, RoundingMode.DOWN);
+            log.info("📊 A осталось {} USDT", usdtEarned);
 
-            if (usdtA.compareTo(BigDecimal.ONE) < 0) {
-                log.warn("⚠ Недостаточно USDT для продолжения цикла ({}), выходим", usdtA);
-                return;
-            }
-
-            // Лимитка на покупку (A)
+            // 4️⃣ A ставит лимитку на покупку на эту сумму
             BigDecimal buyPrice = mexcTradeService.getNearUpperSpreadPrice(symbol);
-            String limitBuyOrderId = mexcTradeService.placeLimitBuyAccountA(symbol, buyPrice, usdtA, chatId);
-            log.info("A ➡ Выставил лимитку на покупку на {} USDT @ {}, ордер={}", usdtA, buyPrice, limitBuyOrderId);
+            mexcTradeService.placeLimitBuyAccountA(symbol, buyPrice, usdtEarned, chatId);
+            log.info("A ➡ Лимитная покупка на {} USDT @ {}", usdtEarned, buyPrice);
 
-            // B продает
-            mexcTradeService.sellFromAccountB(symbol, buyPrice, usdtA, chatId);
-            log.info("B ➡ Продал в лимитку A {} @ {}", usdtA, buyPrice);
+            // 5️⃣ B продаёт обратно ровно qtyTokens
+            mexcTradeService.marketSellFromAccountB(symbol, buyPrice, qtyTokens, chatId);
+            log.info("B ➡ Продал обратно {} токенов @ {}", qtyTokens, buyPrice);
 
         } catch (Exception e) {
-            log.error("❌ Ошибка в цикле перелива", e);
+            log.error("❌ Ошибка в executeCycle", e);
             try {
-                // Фейл — чистим позицию
                 BigDecimal tokensA = mexcTradeService.getTokenBalanceAccountA(symbol, chatId);
                 if (tokensA.compareTo(BigDecimal.ZERO) > 0) {
                     mexcTradeService.forceMarketSellAccountA(symbol, tokensA, chatId);
