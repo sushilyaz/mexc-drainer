@@ -12,18 +12,18 @@ public class MexcTradeServiceTest {
 
     private final MexcTradeService tradeService = new MexcTradeService();
 
-    @Test
-    public void testMarketBuy() {
-        String symbol = "ANTUSDT";      // тестовый символ
-        BigDecimal usdtAmount = BigDecimal.valueOf(2); // тестовая сумма
-
-        try {
-            // напрямую вызываем метод, минуя MemoryDb
-            String orderId = tradeService.signedMarketBuy(symbol, usdtAmount, API_KEY, SECRET_KEY);
-            System.out.println("Успешно создан market buy, orderId=" + orderId);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
+//    @Test
+//    public void testMarketBuy() {
+//        String symbol = "ANTUSDT";      // тестовый символ
+//        BigDecimal usdtAmount = BigDecimal.valueOf(2); // тестовая сумма
+//
+//        try {
+//            // напрямую вызываем метод, минуя MemoryDb
+//            String orderId = tradeService.signedMarketBuy(symbol, usdtAmount, API_KEY, SECRET_KEY);
+//            System.out.println("Успешно создан market buy, orderId=" + orderId);
+//        } catch (Exception e) {
+//            e.printStackTrace();
+//        }
+//    }
 }
 

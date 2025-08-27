@@ -44,7 +44,6 @@ public class MexcTradeService {
             return j.get("serverTime").asLong();
         } catch (Exception e) {
             log.warn("Не удалось получить serverTime: {}", e.getMessage());
-            // fallback на локальное время, но лучше перезапустить синхронизатор
             return System.currentTimeMillis();
         }
     }
@@ -59,72 +58,58 @@ public class MexcTradeService {
     }
 
     private String buildCanonical(Map<String, String> params) {
-        StringBuilder sb = new StringBuilder();
-        params.forEach((k, v) -> {
-            if (sb.length() > 0) sb.append("&");
-            sb.append(k).append("=").append(v == null ? "" : v);
-        });
-        return sb.toString();
-    }
-
-    private String buildUrlEncoded(Map<String, String> params) {
-        StringBuilder sb = new StringBuilder();
-        params.forEach((k, v) -> {
-            if (sb.length() > 0) sb.append("&");
-            sb.append(URLEncoder.encode(k, StandardCharsets.UTF_8))
-                    .append("=")
-                    .append(URLEncoder.encode(v == null ? "" : v, StandardCharsets.UTF_8));
-        });
-        return sb.toString();
+        return params.entrySet().stream()
+                .map(e -> e.getKey() + "=" + (e.getValue() == null ? "" : e.getValue()))
+                .collect(Collectors.joining("&"));
     }
 
     /**
      * Универсальный подписанный запрос.
-     *
-     * @param method   "GET" | "POST" | "DELETE"
-     * @param path     путь относительно /api/v3, например ACCOUNT_ENDPOINT или ORDER_ENDPOINT
-     * @param params   параметры (will include timestamp automatically)
-     * @param apiKey   ключ пользователя
-     * @param secret   секрет
-     * @return JsonNode с ответом
+     * Все POST-запросы используют query string + пустое тело.
      */
     private JsonNode signedRequest(String method, String path, Map<String, String> params, String apiKey, String secret) {
         try {
             if (params == null) params = new LinkedHashMap<>();
             params.put("timestamp", String.valueOf(getServerTime()));
-            // optional: params.putIfAbsent("recvWindow", "5000");
+            params.put("recvWindow", "5000");
 
-            // canonical string for signature (NO url-encoding)
+            // подпись HMAC-SHA256 по параметрам
             String canonical = buildCanonical(params);
             String signature = hmacSha256Hex(canonical, secret);
+            params.put("signature", signature);
+
+            // финальный query string
+            String finalQuery = buildCanonical(params);
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("X-MEXC-APIKEY", apiKey);
+            headers.setContentType(MediaType.APPLICATION_JSON); // тело пустое, MEXC принимает
+
+            log.info("POST https://api.mexc.com{}?{}", path, finalQuery);
+            log.info("Headers: X-MEXC-APIKEY={}", apiKey);
+            HttpEntity<Void> entity = new HttpEntity<>(headers);
+            ResponseEntity<String> resp;
 
             if ("POST".equalsIgnoreCase(method)) {
-                // body: urlencoded params + &signature=...
-                String body = buildUrlEncoded(params) + "&signature=" + URLEncoder.encode(signature, StandardCharsets.UTF_8);
-
-                HttpHeaders headers = new HttpHeaders();
-                headers.set("X-MEXC-APIKEY", apiKey);
-                headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
-
-                HttpEntity<String> entity = new HttpEntity<>(body, headers);
-                String url = API_BASE + path;
-                ResponseEntity<String> resp = restTemplate.postForEntity(url, entity, String.class);
-                return objectMapper.readTree(resp.getBody());
+                resp = restTemplate.exchange(
+                        API_BASE + path + "?" + finalQuery,
+                        HttpMethod.POST,
+                        entity,
+                        String.class
+                );
             } else {
-                // GET / DELETE -> params in URL, signature appended
-                String urlQuery = buildUrlEncoded(params) + "&signature=" + URLEncoder.encode(signature, StandardCharsets.UTF_8);
-                String url = API_BASE + path + "?" + urlQuery;
-
-                HttpHeaders headers = new HttpHeaders();
-                headers.set("X-MEXC-APIKEY", apiKey);
-                HttpEntity<Void> entity = new HttpEntity<>(headers);
-
                 HttpMethod httpMethod = "DELETE".equalsIgnoreCase(method) ? HttpMethod.DELETE : HttpMethod.GET;
-                ResponseEntity<String> resp = restTemplate.exchange(url, httpMethod, entity, String.class);
-                return objectMapper.readTree(resp.getBody());
+                resp = restTemplate.exchange(
+                        API_BASE + path + "?" + finalQuery,
+                        httpMethod,
+                        entity,
+                        String.class
+                );
             }
+
+            log.debug("{} {} -> Response: {}", method, path, resp.getBody());
+            return objectMapper.readTree(resp.getBody());
+
         } catch (org.springframework.web.client.HttpClientErrorException e) {
-            // логируем полезный ответ сервера
             String body = e.getResponseBodyAsString();
             log.error("HTTP {} {} -> status={}, body={}", method, path, e.getStatusCode(), body);
             throw new RuntimeException("Signed request error: " + e.getStatusCode() + " - " + body, e);
@@ -187,7 +172,7 @@ public class MexcTradeService {
         params.put("symbol", symbol);
         params.put("side", "BUY");
         params.put("type", "MARKET");
-        params.put("quoteOrderQty", usdtAmount.toPlainString()); // покупка на сумму USDT
+        params.put("quoteOrderQty", usdtAmount.toPlainString());
 
         JsonNode resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
         if (resp != null && resp.has("orderId")) return resp.get("orderId").asText();
@@ -204,7 +189,7 @@ public class MexcTradeService {
         params.put("side", "SELL");
         params.put("type", "LIMIT");
         params.put("timeInForce", "GTC");
-        params.put("quantity", qty.setScale(8, RoundingMode.DOWN).toPlainString());
+        params.put("quantity", qty.setScale(18, RoundingMode.DOWN).toPlainString());
         params.put("price", price.stripTrailingZeros().toPlainString());
 
         JsonNode resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
@@ -213,10 +198,6 @@ public class MexcTradeService {
         return null;
     }
 
-    /**
-     * В твоём DrainService ты передаёшь usdtAmount как сумму в USDT для LIMIT BUY —
-     * здесь мы переводим её в quantity = usdtAmount / price.
-     */
     public String placeLimitBuyAccountA(String symbol, BigDecimal price, BigDecimal usdtAmount, Long chatId) {
         var creds = MemoryDb.getAccountA(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
@@ -237,13 +218,25 @@ public class MexcTradeService {
         params.put("side", "BUY");
         params.put("type", "LIMIT");
         params.put("timeInForce", "GTC");
-        params.put("quantity", qty.setScale(8, RoundingMode.DOWN).toPlainString());
+        params.put("quantity", qty.setScale(18, RoundingMode.DOWN).toPlainString());
         params.put("price", price.stripTrailingZeros().toPlainString());
 
         JsonNode resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
         if (resp != null && resp.has("orderId")) return resp.get("orderId").asText();
         log.warn("placeLimitBuyAccountA unexpected response: {}", resp);
         return null;
+    }
+
+    private void placeLimitOrder(String symbol, String side, BigDecimal price, BigDecimal qty, String apiKey, String secret) {
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", side);
+        params.put("type", "LIMIT");
+        params.put("timeInForce", "GTC");
+        params.put("quantity", qty.setScale(18, RoundingMode.DOWN).toPlainString());
+        params.put("price", price.stripTrailingZeros().toPlainString());
+
+        signedRequest("POST", ORDER_ENDPOINT, params, apiKey, secret);
     }
 
     public void buyFromAccountB(String symbol, BigDecimal price, BigDecimal qty, Long chatId) {
@@ -269,18 +262,6 @@ public class MexcTradeService {
         placeLimitOrder(symbol, "SELL", price, qty, creds.getApiKey(), creds.getSecret());
     }
 
-    private void placeLimitOrder(String symbol, String side, BigDecimal price, BigDecimal qty, String apiKey, String secret) {
-        Map<String, String> params = new LinkedHashMap<>();
-        params.put("symbol", symbol);
-        params.put("side", side);
-        params.put("type", "LIMIT");
-        params.put("timeInForce", "GTC");
-        params.put("quantity", qty.setScale(8, RoundingMode.DOWN).toPlainString());
-        params.put("price", price.stripTrailingZeros().toPlainString());
-
-        signedRequest("POST", ORDER_ENDPOINT, params, apiKey, secret);
-    }
-
     public void forceMarketSellAccountA(String symbol, BigDecimal qty, Long chatId) {
         var creds = MemoryDb.getAccountA(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
@@ -289,7 +270,7 @@ public class MexcTradeService {
         params.put("symbol", symbol);
         params.put("side", "SELL");
         params.put("type", "MARKET");
-        params.put("quantity", qty.setScale(8, RoundingMode.DOWN).toPlainString());
+        params.put("quantity", qty.setScale(18, RoundingMode.DOWN).toPlainString());
 
         signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
     }
@@ -298,13 +279,13 @@ public class MexcTradeService {
 
     public BigDecimal getNearLowerSpreadPrice(String symbol) {
         try {
-            String url = API_BASE + TICKER_BOOK + "?symbol=" + URLEncoder.encode(symbol, StandardCharsets.UTF_8);
+            String url = API_BASE + TICKER_BOOK + "?symbol=" + symbol;
             String body = restTemplate.getForObject(url, String.class);
             JsonNode resp = objectMapper.readTree(body);
             BigDecimal bid = new BigDecimal(resp.get("bidPrice").asText());
             BigDecimal ask = new BigDecimal(resp.get("askPrice").asText());
             BigDecimal spread = ask.subtract(bid);
-            return bid.add(spread.multiply(BigDecimal.valueOf(0.1))).setScale(8, RoundingMode.HALF_UP);
+            return bid.add(spread.multiply(BigDecimal.valueOf(0.1))).setScale(18, RoundingMode.HALF_UP);
         } catch (Exception e) {
             log.error("Ошибка получения стакана: {}", e.getMessage(), e);
             throw new RuntimeException(e);
@@ -313,18 +294,21 @@ public class MexcTradeService {
 
     public BigDecimal getNearUpperSpreadPrice(String symbol) {
         try {
-            String url = API_BASE + TICKER_BOOK + "?symbol=" + URLEncoder.encode(symbol, StandardCharsets.UTF_8);
+            String url = API_BASE + TICKER_BOOK + "?symbol=" + symbol;
             String body = restTemplate.getForObject(url, String.class);
             JsonNode resp = objectMapper.readTree(body);
             BigDecimal bid = new BigDecimal(resp.get("bidPrice").asText());
             BigDecimal ask = new BigDecimal(resp.get("askPrice").asText());
             BigDecimal spread = ask.subtract(bid);
-            return ask.subtract(spread.multiply(BigDecimal.valueOf(0.1))).setScale(8, RoundingMode.HALF_UP);
+            return ask.subtract(spread.multiply(BigDecimal.valueOf(0.1))).setScale(18, RoundingMode.HALF_UP);
         } catch (Exception e) {
             log.error("Ошибка получения стакана: {}", e.getMessage(), e);
             throw new RuntimeException(e);
         }
     }
+
+    // ======= тестовый метод можно оставить =======
+
     public String signedMarketBuy(String symbol, BigDecimal usdtAmount, String apiKey, String secret) {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("symbol", symbol);
@@ -332,12 +316,11 @@ public class MexcTradeService {
         params.put("type", "MARKET");
         params.put("quoteOrderQty", usdtAmount.toPlainString());
 
-        // Полностью делегируем добавление timestamp, recvWindow и подписи в signedRequestTest
-        JsonNode resp = signedRequestTest("POST", "/api/v3/order", params, apiKey, secret);
+        JsonNode resp = signedRequest("POST", ORDER_ENDPOINT, params, apiKey, secret);
         if (resp != null && resp.has("orderId")) {
             return resp.get("orderId").asText();
         }
-        System.out.println("MarketBuy response: " + resp);
+        log.warn("signedMarketBuy response: {}", resp);
         return null;
     }
 
