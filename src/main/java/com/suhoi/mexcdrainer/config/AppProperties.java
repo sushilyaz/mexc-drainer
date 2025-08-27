@@ -12,7 +12,7 @@ public class AppProperties {
     private Mexc mexc;
     @Data
     public static class Telegram {
-        private String botToken;
+        private String botToken="8013267846:AAFRYVCj2Et9cRZZmKdxjq7JhnzG8O82mck";
         private String botUsername = "drain_mexc_bot";
     }
     @Data
