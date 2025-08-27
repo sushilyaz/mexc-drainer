@@ -3,8 +3,14 @@ package com.suhoi.mexcdrainer.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.suhoi.mexcdrainer.util.MemoryDb;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.*;
 import org.springframework.stereotype.Service;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.RestTemplate;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -12,246 +18,188 @@ import java.math.BigDecimal;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 
-import org.springframework.http.*;
-import org.springframework.web.client.RestTemplate;
-
-/**
- * Сервис работы с MEXC API (торговля, балансы, стакан).
- */
 @Service
 @Slf4j
+@RequiredArgsConstructor
 public class MexcTradeService {
-
-    private final String API_URL = "https://api.mexc.com";
 
     private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    @Value("${mexc.api.baseurl:https://api.mexc.com}")
 
-    // оффсет времени между локальным и серверным
-    private volatile long timeOffset = 0L;
+    private static final String ACCOUNT_ENDPOINT = "/api/v3/account";
+    private static final String ORDER_ENDPOINT = "/api/v3/order";
+    private static final String EXCHANGE_INFO = "/api/v3/exchangeInfo";
+    private static final String TICKER_BOOK = "/api/v3/ticker/bookTicker";
 
-    public MexcTradeService() {
-        syncServerTime();
-        // Можно периодически обновлять оффсет в отдельном scheduler-е
-        Executors.newSingleThreadScheduledExecutor()
-                .scheduleAtFixedRate(this::syncServerTime, 0, 30, TimeUnit.SECONDS);
-    }
+    /* =========================== SIGNED REQUEST =========================== */
 
-    private void syncServerTime() {
-        try {
-            ResponseEntity<Map> resp = restTemplate.getForEntity(API_URL + "/api/v3/time", Map.class);
-            if (resp.getStatusCode().is2xxSuccessful() && resp.getBody() != null) {
-                long serverTime = ((Number) resp.getBody().get("serverTime")).longValue();
-                long localTime = System.currentTimeMillis();
-                timeOffset = serverTime - localTime;
-                System.out.println("[SYNC] Серверное время: " + serverTime + ", локальное: " + localTime + ", оффсет=" + timeOffset);
-            }
-        } catch (Exception e) {
-            System.err.println("[SYNC] Ошибка получения времени: " + e.getMessage());
-        }
-    }
-
-    private long currentTimestamp() {
-        return System.currentTimeMillis() + timeOffset;
-    }
-
-    // ===== Вспомогательные методы =====
-
-    private String sign(String query, String secretKey) throws Exception {
-        Mac sha256_HMAC = Mac.getInstance("HmacSHA256");
-        SecretKeySpec secret_key = new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
-        sha256_HMAC.init(secret_key);
-        return HexFormat.of().formatHex(sha256_HMAC.doFinal(query.getBytes(StandardCharsets.UTF_8)));
-    }
-
-    private String bytesToHex(byte[] hash) {
-        StringBuilder hexString = new StringBuilder(2 * hash.length);
+    private String signParams(String query, String secretKey) throws Exception {
+        Mac hmacSHA256 = Mac.getInstance("HmacSHA256");
+        SecretKeySpec secretKeySpec = new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+        hmacSHA256.init(secretKeySpec);
+        byte[] hash = hmacSHA256.doFinal(query.getBytes(StandardCharsets.UTF_8));
+        StringBuilder result = new StringBuilder();
         for (byte b : hash) {
-            String hex = Integer.toHexString(0xff & b);
-            if (hex.length() == 1)
-                hexString.append('0');
-            hexString.append(hex);
+            result.append(String.format("%02x", b));
         }
-        return hexString.toString();
+        return result.toString();
     }
 
-    private ResponseEntity<String> signedRequest(String method, String path, Map<String, String> params, String apiKey, String secretKey) throws Exception {
-        params.put("timestamp", String.valueOf(currentTimestamp()));
-
-        StringBuilder query = new StringBuilder();
-        for (Map.Entry<String, String> entry : params.entrySet()) {
-            if (query.length() > 0) query.append("&");
-            query.append(URLEncoder.encode(entry.getKey(), StandardCharsets.UTF_8))
-                    .append("=")
-                    .append(URLEncoder.encode(entry.getValue(), StandardCharsets.UTF_8));
-        }
-
-        String signature = sign(query.toString(), secretKey);
-        query.append("&signature=").append(signature);
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.set("X-MEXC-APIKEY", apiKey);
-
-        HttpEntity<String> entity = new HttpEntity<>(headers);
-        String url = API_URL + path + "?" + query;
-
-        if (method.equalsIgnoreCase("GET")) {
-            return restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
-        } else if (method.equalsIgnoreCase("POST")) {
-            return restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
-        } else if (method.equalsIgnoreCase("DELETE")) {
-            return restTemplate.exchange(url, HttpMethod.DELETE, entity, String.class);
-        }
-        throw new IllegalArgumentException("Unsupported method: " + method);
-    }
-
-    // ===== Основные методы =====
-
-    /**
-     * Проверка балансов
-     */
-    public boolean checkBalances(BigDecimal usdtAmount, Long chatId) {
+    private JsonNode signedRequest(String url, Map<String, String> params, String apiKey, String secretKey, HttpMethod method) {
         try {
-            BigDecimal balanceA = getUsdtBalance(MemoryDb.getAccountA(chatId).getApiKey(), MemoryDb.getAccountA(chatId).getSecret());
-            BigDecimal balanceB = getUsdtBalance(MemoryDb.getAccountB(chatId).getApiKey(), MemoryDb.getAccountB(chatId).getSecret());
+            params.put("timestamp", String.valueOf(System.currentTimeMillis()));
 
-            log.info("💰 Баланс A: {} USDT | Баланс B: {} USDT", balanceA, balanceB);
+            String query = getQuery(params);
+            String signature = signParams(query, secretKey);
+            query += "&signature=" + signature;
 
-            return balanceA.compareTo(usdtAmount) >= 0 && balanceB.compareTo(BigDecimal.ONE) >= 0;
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("X-MEXC-APIKEY", apiKey);
+            headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+
+            HttpEntity<?> entity = new HttpEntity<>(headers);
+
+            ResponseEntity<String> resp = restTemplate.exchange(url + "?" + query, method, entity, String.class);
+            return objectMapper.readTree(resp.getBody());
         } catch (Exception e) {
-            log.error("Ошибка при проверке балансов", e);
-            return false;
+            throw new RuntimeException("Signed request error: " + e.getMessage(), e);
         }
     }
 
-    private BigDecimal getUsdtBalance(String apiKey, String secretKey) throws Exception {
-        ResponseEntity<String> resp = signedRequest("GET", "/api/v3/account", new HashMap<>(), apiKey, secretKey);
-        JsonNode root = objectMapper.readTree(resp.getBody());
-        for (JsonNode asset : root.get("balances")) {
-            if (asset.get("asset").asText().equals("USDT")) {
-                return new BigDecimal(asset.get("free").asText());
+    private String getQuery(Map<String, String> params) {
+        return params.entrySet().stream()
+                .map(e -> e.getKey() + "=" + URLEncoder.encode(e.getValue(), StandardCharsets.UTF_8))
+                .reduce((a, b) -> a + "&" + b).orElse("");
+    }
+
+    /* =========================== BALANCES =========================== */
+
+    public BigDecimal getUsdtBalanceAccountA(Long chatId) {
+        return getAssetBalance(MemoryDb.getAccountA(chatId).getApiKey(), MemoryDb.getAccountA(chatId).getSecret(), "USDT");
+    }
+
+    public BigDecimal getTokenBalanceAccountA(String symbol, Long chatId) {
+        String asset = symbol.replace("USDT", ""); // например ANTUSDT → ANT
+        return getAssetBalance(MemoryDb.getAccountA(chatId).getApiKey(), MemoryDb.getAccountA(chatId).getSecret(), asset);
+    }
+
+    public BigDecimal getAssetBalance(String apiKey, String secretKey, String asset) {
+        Map<String, String> params = new HashMap<>();
+        JsonNode resp = signedRequest("https://api.mexc.com" + ACCOUNT_ENDPOINT, params, apiKey, secretKey, HttpMethod.GET);
+
+        for (JsonNode balance : resp.get("balances")) {
+            if (balance.get("asset").asText().equalsIgnoreCase(asset)) {
+                return new BigDecimal(balance.get("free").asText());
             }
         }
         return BigDecimal.ZERO;
     }
 
-    /**
-     * Рыночная покупка аккаунтом A
-     */
-    public String marketBuyAccountA(String symbol, BigDecimal usdtAmount, Long chatId) throws Exception {
-        return placeOrder(MemoryDb.getAccountA(chatId).getApiKey(), MemoryDb.getAccountA(chatId).getSecret(), symbol, "BUY", "MARKET", usdtAmount, null);
+    public boolean checkBalances(BigDecimal usdtAmount, Long chatId) {
+        BigDecimal usdtA = getUsdtBalanceAccountA(chatId);
+        log.info("Баланс A: {} USDT", usdtA);
+        return usdtA.compareTo(usdtAmount) >= 0;
     }
 
-    /**
-     * Лимитная продажа аккаунтом A
-     */
-    public String placeLimitSellAccountA(String symbol, BigDecimal price, BigDecimal usdtAmount, Long chatId) throws Exception {
-        return placeOrder(MemoryDb.getAccountA(chatId).getApiKey(), MemoryDb.getAccountA(chatId).getSecret(), symbol, "SELL", "LIMIT", usdtAmount, price);
+    /* =========================== ORDERS =========================== */
+
+    public String marketBuyAccountA(String symbol, BigDecimal usdtAmount, Long chatId) {
+        Map<String, String> params = new HashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "BUY");
+        params.put("type", "MARKET");
+        params.put("quoteOrderQty", usdtAmount.toPlainString()); // покупка на сумму USDT
+
+        JsonNode resp = signedRequest("https://api.mexc.com" + ORDER_ENDPOINT, params, MemoryDb.getAccountA(chatId).getApiKey(), MemoryDb.getAccountA(chatId).getSecret(), HttpMethod.POST);
+        return resp.get("orderId").asText();
     }
 
-    /**
-     * Лимитная покупка аккаунтом A
-     */
-    public String placeLimitBuyAccountA(String symbol, BigDecimal price, BigDecimal usdtAmount, Long chatId) throws Exception {
-        return placeOrder(MemoryDb.getAccountA(chatId).getApiKey(), MemoryDb.getAccountA(chatId).getSecret(), symbol, "BUY", "LIMIT", usdtAmount, price);
+    public String placeLimitSellAccountA(String symbol, BigDecimal price, BigDecimal qty, Long chatId) {
+        Map<String, String> params = new HashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "SELL");
+        params.put("type", "LIMIT");
+        params.put("timeInForce", "GTC");
+        params.put("quantity", qty.toPlainString());
+        params.put("price", price.toPlainString());
+
+        JsonNode resp = signedRequest("https://api.mexc.com" + ORDER_ENDPOINT, params, MemoryDb.getAccountA(chatId).getApiKey(), MemoryDb.getAccountA(chatId).getSecret(), HttpMethod.POST);
+        return resp.get("orderId").asText();
     }
 
-    /**
-     * Аккаунт B покупает у A
-     */
-    public void buyFromAccountB(String symbol, BigDecimal price, BigDecimal usdtAmount,  Long chatId) throws Exception {
-        placeOrder(MemoryDb.getAccountB(chatId).getApiKey(), MemoryDb.getAccountB(chatId).getSecret(), symbol, "BUY", "MARKET", usdtAmount, null);
+    public String placeLimitBuyAccountA(String symbol, BigDecimal price, BigDecimal usdtAmount, Long chatId) {
+        Map<String, String> params = new HashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "BUY");
+        params.put("type", "LIMIT");
+        params.put("timeInForce", "GTC");
+        params.put("quoteOrderQty", usdtAmount.toPlainString());
+        params.put("price", price.toPlainString());
+
+        JsonNode resp = signedRequest("https://api.mexc.com" + ORDER_ENDPOINT, params, MemoryDb.getAccountA(chatId).getApiKey(), MemoryDb.getAccountA(chatId).getSecret(), HttpMethod.POST);
+        return resp.get("orderId").asText();
     }
 
-    /**
-     * Аккаунт B продаёт
-     */
-    public void sellFromAccountB(String symbol, BigDecimal price, BigDecimal usdtAmount, Long chatId) throws Exception {
-        placeOrder(MemoryDb.getAccountB(chatId).getApiKey(), MemoryDb.getAccountB(chatId).getSecret(), symbol, "SELL", "MARKET", usdtAmount, null);
+    public void buyFromAccountB(String symbol, BigDecimal price, BigDecimal qty, Long chatId) {
+        placeLimitOrder(symbol, "BUY", price, qty, MemoryDb.getAccountB(chatId).getApiKey(), MemoryDb.getAccountB(chatId).getSecret());
     }
 
-    /**
-     * Форсированная продажа аккаунтом A
-     */
-    public void forceMarketSellAccountA(String symbol, BigDecimal usdtAmount, Long chatId) throws Exception {
-        try {
-            placeOrder(MemoryDb.getAccountB(chatId).getApiKey(), MemoryDb.getAccountB(chatId).getSecret(), symbol, "SELL", "MARKET", usdtAmount, null);
-        } catch (Exception e) {
-            log.error("Ошибка при аварийной продаже", e);
-        }
+    public void sellFromAccountB(String symbol, BigDecimal price, BigDecimal usdtAmount, Long chatId) {
+        BigDecimal qty = usdtAmount.divide(price, 8, BigDecimal.ROUND_DOWN);
+        placeLimitOrder(symbol, "SELL", price, qty, MemoryDb.getAccountB(chatId).getApiKey(), MemoryDb.getAccountB(chatId).getSecret());
     }
 
-    /**
-     * Создание ордера
-     */
-    private String placeOrder(String apiKey, String secretKey, String symbol, String side,
-                              String type, BigDecimal usdtAmount, BigDecimal price) throws Exception {
-        Map<String, String> params = new LinkedHashMap<>();
+    private void placeLimitOrder(String symbol, String side, BigDecimal price, BigDecimal qty,
+                                 String apiKey, String secretKey) {
+        Map<String, String> params = new HashMap<>();
         params.put("symbol", symbol);
         params.put("side", side);
-        params.put("type", type);
+        params.put("type", "LIMIT");
+        params.put("timeInForce", "GTC");
+        params.put("quantity", qty.toPlainString());
+        params.put("price", price.toPlainString());
 
-        if (type.equals("MARKET")) {
-            // Для MARKET на MEXC нужно указывать quoteOrderQty (в USDT)
-            params.put("quoteOrderQty", usdtAmount.toPlainString());
-        } else if (type.equals("LIMIT")) {
-            params.put("price", price.toPlainString());
-            // Считаем количество монеты
-            BigDecimal qty = usdtAmount.divide(price, 8, BigDecimal.ROUND_DOWN);
-            params.put("quantity", qty.toPlainString());
-            params.put("timeInForce", "GTC");
-        }
-
-        ResponseEntity<String> resp = signedRequest("POST", "/api/v3/order", params, apiKey, secretKey);
-        JsonNode root = objectMapper.readTree(resp.getBody());
-
-        String orderId = root.get("orderId").asText();
-        log.info("📑 Ордер создан: {} {} {} {} (id={})", side, type, symbol, usdtAmount, orderId);
-
-        return orderId;
+        signedRequest("https://api.mexc.com" + ORDER_ENDPOINT, params, apiKey, secretKey, HttpMethod.POST);
     }
 
-    /**
-     * Получение цены возле нижней границы спреда
-     */
+    public void forceMarketSellAccountA(String symbol, BigDecimal qty, Long chatId) {
+        Map<String, String> params = new HashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "SELL");
+        params.put("type", "MARKET");
+        params.put("quantity", qty.toPlainString());
+
+        signedRequest("https://api.mexc.com" + ORDER_ENDPOINT, params, MemoryDb.getAccountA(chatId).getApiKey(), MemoryDb.getAccountA(chatId).getSecret(), HttpMethod.POST);
+    }
+
+    /* =========================== СПРЕД =========================== */
+
     public BigDecimal getNearLowerSpreadPrice(String symbol) {
         try {
-            String url = API_URL + "/api/v3/depth?symbol=" + symbol + "&limit=5";
+            String url = "https://api.mexc.com" + TICKER_BOOK + "?symbol=" + symbol;
             String body = restTemplate.getForObject(url, String.class);
-            JsonNode root = objectMapper.readTree(body);
-
-            BigDecimal bestBid = new BigDecimal(root.get("bids").get(0).get(0).asText());
-            BigDecimal bestAsk = new BigDecimal(root.get("asks").get(0).get(0).asText());
-
-            BigDecimal price = bestBid.add(bestAsk.subtract(bestBid).multiply(BigDecimal.valueOf(0.1))); // 10% от спреда внутрь
-            return price.setScale(6, BigDecimal.ROUND_HALF_UP);
+            JsonNode resp = objectMapper.readTree(body);
+            BigDecimal bid = new BigDecimal(resp.get("bidPrice").asText());
+            BigDecimal ask = new BigDecimal(resp.get("askPrice").asText());
+            return bid.add(ask).divide(BigDecimal.valueOf(2), 8, BigDecimal.ROUND_HALF_UP);
         } catch (Exception e) {
-            log.error("Ошибка получения стакана", e);
-            return BigDecimal.ONE;
+            throw new RuntimeException("Ошибка при получении спреда", e);
         }
     }
 
-    /**
-     * Получение цены возле верхней границы спреда
-     */
     public BigDecimal getNearUpperSpreadPrice(String symbol) {
         try {
-            String url = API_URL + "/api/v3/depth?symbol=" + symbol + "&limit=5";
+            String url = "https://api.mexc.com" + TICKER_BOOK + "?symbol=" + symbol;
             String body = restTemplate.getForObject(url, String.class);
-            JsonNode root = objectMapper.readTree(body);
-
-            BigDecimal bestBid = new BigDecimal(root.get("bids").get(0).get(0).asText());
-            BigDecimal bestAsk = new BigDecimal(root.get("asks").get(0).get(0).asText());
-
-            BigDecimal price = bestAsk.subtract(bestAsk.subtract(bestBid).multiply(BigDecimal.valueOf(0.1))); // 10% внутрь
-            return price.setScale(6, BigDecimal.ROUND_HALF_UP);
+            JsonNode resp = objectMapper.readTree(body);
+            BigDecimal bid = new BigDecimal(resp.get("bidPrice").asText());
+            BigDecimal ask = new BigDecimal(resp.get("askPrice").asText());
+            return ask.subtract(ask.subtract(bid).divide(BigDecimal.valueOf(2), 8, BigDecimal.ROUND_HALF_UP));
         } catch (Exception e) {
-            log.error("Ошибка получения стакана", e);
-            return BigDecimal.ONE;
+            throw new RuntimeException("Ошибка при получении спреда", e);
         }
     }
 }
