@@ -3,19 +3,16 @@ package com.suhoi.mexcdrainer.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.suhoi.mexcdrainer.util.MemoryDb;
-import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestTemplate;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -36,7 +33,13 @@ public class MexcTradeService {
 
     public static final long EXCHANGE_INFO_TTL_MS = 60_000L;
 
+    // --- Комиссии (настраиваемые). По умолчанию 0.2% и небольшой safety-запас.
+    private static final BigDecimal MAKER_FEE = new BigDecimal("0.0000"); // 0%
+    private static final BigDecimal TAKER_FEE = new BigDecimal("0.0005"); // 0.05%
+    private static final BigDecimal FEE_SAFETY = new BigDecimal("0.0010"); // +0.10% запас
+
     public final Map<String, CachedSymbolInfo> exchangeInfoCache = new ConcurrentHashMap<>();
+
     public static final class SymbolFilters {
         final BigDecimal tickSize;     // PRICE_FILTER.tickSize (цена)
         final BigDecimal stepSize;     // LOT_SIZE.stepSize (кол-во базовой)
@@ -57,7 +60,6 @@ public class MexcTradeService {
         }
     }
 
-
     public static final class CachedSymbolInfo {
         final SymbolFilters filters;
         final long loadedAt;
@@ -66,6 +68,7 @@ public class MexcTradeService {
             this.loadedAt = loadedAt;
         }
     }
+
     private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -99,8 +102,7 @@ public class MexcTradeService {
     }
 
     /**
-     * Универсальный подписанный запрос.
-     * Все POST-запросы используют query string + пустое тело.
+     * Универсальный подписанный запрос. Для GET/DELETE/POST.
      */
     private JsonNode signedRequest(String method, String path, Map<String, String> params, String apiKey, String secret) {
         try {
@@ -108,40 +110,24 @@ public class MexcTradeService {
             params.put("timestamp", String.valueOf(getServerTime()));
             params.put("recvWindow", "5000");
 
-            // подпись HMAC-SHA256 по параметрам
             String canonical = buildCanonical(params);
             String signature = hmacSha256Hex(canonical, secret);
             params.put("signature", signature);
 
-            // финальный query string
             String finalQuery = buildCanonical(params);
             HttpHeaders headers = new HttpHeaders();
             headers.set("X-MEXC-APIKEY", apiKey);
-            headers.setContentType(MediaType.APPLICATION_JSON); // тело пустое, MEXC принимает
-
-            log.info("{} https://api.mexc.com{}?{}", method, path, finalQuery);
-
+            headers.setContentType(MediaType.APPLICATION_JSON);
             HttpEntity<Void> entity = new HttpEntity<>(headers);
-            ResponseEntity<String> resp;
 
-            if ("POST".equalsIgnoreCase(method)) {
-                resp = restTemplate.exchange(
-                        API_BASE + path + "?" + finalQuery,
-                        HttpMethod.POST,
-                        entity,
-                        String.class
-                );
-            } else {
-                HttpMethod httpMethod = "DELETE".equalsIgnoreCase(method) ? HttpMethod.DELETE : HttpMethod.GET;
-                resp = restTemplate.exchange(
-                        API_BASE + path + "?" + finalQuery,
-                        httpMethod,
-                        entity,
-                        String.class
-                );
-            }
+            HttpMethod httpMethod = switch (method.toUpperCase()) {
+                case "GET" -> HttpMethod.GET;
+                case "DELETE" -> HttpMethod.DELETE;
+                default -> HttpMethod.POST;
+            };
 
-            log.debug("{} {} -> Response: {}", method, path, resp.getBody());
+            log.info("{} https://api.mexc.com{}?{}", httpMethod.name(), path, finalQuery);
+            ResponseEntity<String> resp = restTemplate.exchange(API_BASE + path + "?" + finalQuery, httpMethod, entity, String.class);
             return objectMapper.readTree(resp.getBody());
 
         } catch (org.springframework.web.client.HttpClientErrorException e) {
@@ -170,7 +156,7 @@ public class MexcTradeService {
 
     public BigDecimal getTokenBalanceAccountB(String symbol, Long chatId) {
         var creds = MemoryDb.getAccountB(chatId);
-        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
         String asset = symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4) : symbol;
         return getAssetBalance(creds.getApiKey(), creds.getSecret(), asset);
     }
@@ -193,36 +179,9 @@ public class MexcTradeService {
         return BigDecimal.ZERO;
     }
 
-    public boolean checkBalances(BigDecimal usdtAmount, Long chatId) {
-        try {
-            BigDecimal usdt = getUsdtBalanceAccountA(chatId);
-            log.info("Баланс A: {} USDT", usdt);
-            return usdt.compareTo(usdtAmount) >= 0;
-        } catch (Exception e) {
-            log.error("Ошибка при checkBalances: {}", e.getMessage(), e);
-            return false;
-        }
-    }
-
     // ======= ORDERS =======
 
-    public String marketBuyAccountA(String symbol, BigDecimal usdtAmount, Long chatId) {
-        var creds = MemoryDb.getAccountA(chatId);
-        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
-
-        Map<String, String> params = new LinkedHashMap<>();
-        params.put("symbol", symbol);
-        params.put("side", "BUY");
-        params.put("type", "MARKET");
-        params.put("quoteOrderQty", usdtAmount.toPlainString());
-
-        JsonNode resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
-        if (resp != null && resp.has("orderId")) return resp.get("orderId").asText();
-        log.warn("marketBuyAccountA unexpected response: {}", resp);
-        return null;
-    }
-
-    // ⬇️ НОВОЕ: рыночная покупка A с FULL-ответом и ожиданием FILLED при необходимости
+    // Рынок BUY A с FULL-ответом (+дожидание при необходимости)
     public OrderInfo marketBuyAccountAFull(String symbol, BigDecimal usdtAmount, Long chatId) {
         var creds = MemoryDb.getAccountA(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
@@ -232,7 +191,7 @@ public class MexcTradeService {
         params.put("side", "BUY");
         params.put("type", "MARKET");
         params.put("quoteOrderQty", usdtAmount.stripTrailingZeros().toPlainString());
-        params.put("newOrderRespType", "FULL"); // критично
+        params.put("newOrderRespType", "FULL");
 
         long t0 = System.currentTimeMillis();
         JsonNode resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
@@ -295,7 +254,7 @@ public class MexcTradeService {
         params.put("timeInForce", "GTC");
         params.put("quantity", normQty.toPlainString());
         params.put("price",    normPrice.toPlainString());
-        params.put("newOrderRespType", "ACK"); // лёгкий ответ; ждать FILLED будем отдельно
+        params.put("newOrderRespType", "ACK");
 
         JsonNode resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
         String orderId = (resp != null && resp.has("orderId")) ? resp.get("orderId").asText() : null;
@@ -307,9 +266,8 @@ public class MexcTradeService {
         return orderId;
     }
 
-
-
-    public String placeLimitBuyAccountA(String symbol, BigDecimal price, BigDecimal usdtAmount, Long chatId) {
+    // --- BUY A: перегрузка с ограничением максимального количества (под B SELL)
+    public String placeLimitBuyAccountA(String symbol, BigDecimal price, BigDecimal usdtAmount, BigDecimal maxQty, Long chatId) {
         var creds = MemoryDb.getAccountA(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
 
@@ -323,13 +281,18 @@ public class MexcTradeService {
         try { rawQty = usdtAmount.divide(normPrice, 18, RoundingMode.DOWN); } catch (Exception ignore) {}
         BigDecimal qty = normalizeQty(rawQty, f);
 
-        // если не тянем minNotional — поднимем qty, если позволяет бюджет
+        // ограничим сверху maxQty (если задан)
+        if (maxQty != null && maxQty.signum() > 0) {
+            BigDecimal maxNorm = normalizeQty(maxQty, f);
+            if (qty.compareTo(maxNorm) > 0) qty = maxNorm;
+        }
+
         BigDecimal cost = qty.multiply(normPrice);
         BigDecimal minQtyNeed = minQtyForNotional(normPrice, f.stepSize, effMinNotional);
 
         if (qty.compareTo(minQtyNeed) < 0) {
             BigDecimal needCost = minQtyNeed.multiply(normPrice);
-            if (needCost.compareTo(usdtAmount) <= 0) {
+            if (needCost.compareTo(usdtAmount) <= 0 && (maxQty == null || minQtyNeed.compareTo(maxQty) <= 0)) {
                 qty = minQtyNeed;
                 cost = qty.multiply(normPrice);
             } else {
@@ -342,6 +305,11 @@ public class MexcTradeService {
         // безопасность: не выходим за бюджет (после коррекций)
         if (cost.compareTo(usdtAmount) > 0) {
             qty = normalizeQty(usdtAmount.divide(normPrice, 18, RoundingMode.DOWN), f);
+            // снова учесть ограничение maxQty
+            if (maxQty != null && maxQty.signum() > 0) {
+                BigDecimal maxNorm = normalizeQty(maxQty, f);
+                if (qty.compareTo(maxNorm) > 0) qty = maxNorm;
+            }
             cost = qty.multiply(normPrice);
         }
 
@@ -377,20 +345,66 @@ public class MexcTradeService {
         return orderId;
     }
 
-
-
-    private void placeLimitOrder(String symbol, String side, BigDecimal price, BigDecimal qty, String apiKey, String secret) {
-        Map<String, String> params = new LinkedHashMap<>();
-        params.put("symbol", symbol);
-        params.put("side", side);
-        params.put("type", "LIMIT");
-        params.put("timeInForce", "GTC");
-        params.put("quantity", qty.setScale(5, RoundingMode.DOWN).toPlainString());
-        params.put("price", price.stripTrailingZeros().toPlainString());
-
-        signedRequest("POST", ORDER_ENDPOINT, params, apiKey, secret);
+    // Старая сигнатура — оставлена как обёртка
+    public String placeLimitBuyAccountA(String symbol, BigDecimal price, BigDecimal usdtAmount, Long chatId) {
+        return placeLimitBuyAccountA(symbol, price, usdtAmount, null, chatId);
     }
 
+    // === Планирование MARKET SELL B без отправки — чтобы согласовать с BUY A
+    public BigDecimal planMarketSellQtyAccountB(String symbol, BigDecimal price, BigDecimal requestedQty, Long chatId) {
+        var creds = MemoryDb.getAccountB(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
+
+        SymbolFilters f = getSymbolFilters(symbol);
+        String asset = symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4) : symbol;
+        BigDecimal available = getAssetBalance(creds.getApiKey(), creds.getSecret(), asset);
+
+        if (available.signum() <= 0) {
+            log.warn("PLAN SELL {}: у B нет доступных токенов ({})", symbol, asset);
+            return BigDecimal.ZERO;
+        }
+
+        BigDecimal requested = (requestedQty == null) ? BigDecimal.ZERO : requestedQty;
+        BigDecimal capped = requested.compareTo(available) <= 0 ? requested : available;
+        BigDecimal normQty = normalizeQty(capped, f);
+
+        // Проверка minNotional (если биржа требует)
+        BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
+        if (effMinNotional.signum() > 0 && price != null && price.signum() > 0) {
+            BigDecimal estNotional = price.multiply(normQty);
+            if (estNotional.compareTo(effMinNotional) < 0) {
+                BigDecimal needQty = effMinNotional
+                        .divide(price, 0, RoundingMode.CEILING)
+                        .multiply(f.stepSize);
+                BigDecimal multiples = needQty.divide(f.stepSize, 0, RoundingMode.CEILING);
+                needQty = multiples.multiply(f.stepSize);
+
+                if (needQty.compareTo(available) <= 0) {
+                    normQty = needQty;
+                } else {
+                    log.warn("PLAN SELL {}: minNotional={} не покрывается: доступно {} {}, требуется qty={} при price={}.",
+                            symbol,
+                            effMinNotional.stripTrailingZeros().toPlainString(),
+                            available.stripTrailingZeros().toPlainString(), asset,
+                            needQty.stripTrailingZeros().toPlainString(),
+                            price.stripTrailingZeros().toPlainString());
+                    return BigDecimal.ZERO;
+                }
+            }
+        }
+
+        log.info("PLAN SELL {}: qty={} | requested={} available={} | stepSize={} minNotional(eff)={}",
+                symbol,
+                normQty.toPlainString(),
+                requested.stripTrailingZeros().toPlainString(),
+                available.stripTrailingZeros().toPlainString(),
+                f.stepSize.stripTrailingZeros().toPlainString(),
+                resolveMinNotional(symbol, f.minNotional).stripTrailingZeros().toPlainString());
+
+        return normQty;
+    }
+
+    // Рынок BUY B (учитываем комиссию в требуемой сумме, плюс запас)
     public void marketBuyFromAccountB(String symbol, BigDecimal price, BigDecimal qty, Long chatId) {
         var creds = MemoryDb.getAccountB(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
@@ -398,10 +412,11 @@ public class MexcTradeService {
         SymbolFilters f = getSymbolFilters(symbol);
         int quoteScale = resolveQuoteScale(symbol, f);
 
-        // 1) Оценка требуемой суммы
+        // 1) Оценка требуемой суммы (с учётом комиссии taker + safety)
         BigDecimal requiredUsdt = BigDecimal.ZERO;
         try {
-            requiredUsdt = price.multiply(qty); // без setScale — нормализуем ниже
+            BigDecimal base = price.multiply(qty);
+            requiredUsdt = addFeeUp(base, TAKER_FEE, FEE_SAFETY);
         } catch (Exception ex) {
             log.warn("Ошибка расчёта requiredUsdt: {}", ex.getMessage(), ex);
         }
@@ -417,7 +432,9 @@ public class MexcTradeService {
         if (availableUsdt.compareTo(requiredUsdt) < 0) {
             BigDecimal adjustedQty = BigDecimal.ZERO;
             try {
-                adjustedQty = availableUsdt.divide(price, 18, RoundingMode.DOWN);
+                // обратный расчёт по цене и (1+fee)
+                BigDecimal denom = addFeeUp(price, TAKER_FEE, FEE_SAFETY); // цена с накидкой
+                adjustedQty = availableUsdt.divide(denom, 18, RoundingMode.DOWN);
             } catch (Exception ignore) {}
             if (adjustedQty.compareTo(BigDecimal.ZERO) <= 0) {
                 log.warn("B недостаточно USDT ({}) чтобы купить хоть немного токенов по цене {}", availableUsdt, price);
@@ -434,7 +451,6 @@ public class MexcTradeService {
         // 3) Нормализуем quoteOrderQty по точности котируемой валюты
         BigDecimal quote = normalizeQuoteAmount(requiredUsdt, quoteScale);
 
-        // Полезный лог: до/после нормализации
         log.info("MARKET BUY[B] {} precheck: price={} qty={} requiredUsdt={} -> quote(norm,scale={})={}",
                 symbol,
                 price.stripTrailingZeros().toPlainString(),
@@ -442,7 +458,7 @@ public class MexcTradeService {
                 requiredUsdt.stripTrailingZeros().toPlainString(),
                 quoteScale, quote.toPlainString());
 
-        // 4) Порог 1 USDT (дефолт для USDT-пар). Если меньше — пропускаем шаг.
+        // 4) Порог 1 USDT (эффективный)
         BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
         if (symbol.endsWith("USDT") && quote.compareTo(effMinNotional) < 0) {
             log.warn("MARKET BUY[B] {}: quote={} < minNotional={} USDT — ордер НЕ отправлен.",
@@ -462,40 +478,35 @@ public class MexcTradeService {
         } catch (RuntimeException ex) {
             String msg = ex.getMessage() != null ? ex.getMessage() : "";
             if (msg.contains("amount scale is invalid") || msg.contains("scale is invalid")) {
-                // Попробуем более грубый scale
                 int[] fallbacks = {Math.min(quoteScale, 8), 6, 4, 2, 0};
                 for (int s : fallbacks) {
-                    if (s == quoteScale) continue; // уже пробовали
+                    if (s == quoteScale) continue;
                     BigDecimal q2 = normalizeQuoteAmount(requiredUsdt.min(availableUsdt), s);
                     if (symbol.endsWith("USDT") && q2.compareTo(effMinNotional) < 0) {
-                        continue; // не проходить по порогу — бессмысленно ретраить
+                        continue;
                     }
                     log.warn("MARKET BUY[B] {}: ретрай с более грубым scale={}, quote={}", symbol, s, q2.toPlainString());
                     params.put("quoteOrderQty", q2.toPlainString());
                     try {
                         signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
-                        return; // успех
+                        return;
                     } catch (RuntimeException ex2) {
                         String m2 = ex2.getMessage() != null ? ex2.getMessage() : "";
                         if (!(m2.contains("amount scale is invalid") || m2.contains("scale is invalid"))) {
-                            throw ex2; // иная ошибка — пробрасываем
+                            throw ex2;
                         }
                     }
                 }
             }
-            // Если дошли сюда — ретраи не помогли
             throw ex;
         }
     }
 
-
-    // Исправленный marketSellFromAccountB — продаёт qty токенов (если B имеет меньше — уменьшаем qty).
-    // ⬇️ Заменить целиком
+    // MARKET SELL B — теперь используем ровно планируемое количество
     public void marketSellFromAccountB(String symbol, BigDecimal price, BigDecimal qty, Long chatId) {
         var creds = MemoryDb.getAccountB(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
 
-        // Для MARKET SELL передаём quantity (базовый ассет). price используем только для оценки notional.
         SymbolFilters f = getSymbolFilters(symbol);
 
         String asset = symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4) : symbol;
@@ -506,37 +517,18 @@ public class MexcTradeService {
             return;
         }
 
-        // Не продаём больше, чем есть
         BigDecimal requested = (qty == null) ? BigDecimal.ZERO : qty;
         BigDecimal capped = requested.compareTo(available) <= 0 ? requested : available;
-
-        // Нормализуем к stepSize (строго вниз)
         BigDecimal normQty = normalizeQty(capped, f);
 
-        // Проверим minNotional, если задан, при наличии адекватной оценочной цены
-        if (f.minNotional.signum() > 0 && price != null && price.signum() > 0) {
+        // Проверим minNotional (если задан)
+        BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
+        if (effMinNotional.signum() > 0 && price != null && price.signum() > 0) {
             BigDecimal estNotional = price.multiply(normQty);
-            if (estNotional.compareTo(f.minNotional) < 0) {
-                // Сколько нужно продать минимум при этой цене
-                BigDecimal needQty = f.minNotional
-                        .divide(price, 0, RoundingMode.CEILING)  // минимум штук
-                        .multiply(f.stepSize);                    // на сетку шага
-                // подогнать к сетке
-                BigDecimal multiples = needQty.divide(f.stepSize, 0, RoundingMode.CEILING);
-                needQty = multiples.multiply(f.stepSize);
-
-                if (needQty.compareTo(available) <= 0) {
-                    normQty = needQty;
-                    estNotional = price.multiply(normQty);
-                } else {
-                    log.warn("MARKET SELL {}: minNotional={} не покрывается: доступно {} {}, требуется qty={} при price={}. Ордер не отправлен.",
-                            symbol,
-                            f.minNotional.stripTrailingZeros().toPlainString(),
-                            available.stripTrailingZeros().toPlainString(), asset,
-                            needQty.stripTrailingZeros().toPlainString(),
-                            price.stripTrailingZeros().toPlainString());
-                    return;
-                }
+            if (estNotional.compareTo(effMinNotional) < 0) {
+                log.warn("MARKET SELL {}: estNotional={} < minNotional(eff)={}, ордер не отправлен.",
+                        symbol, estNotional.stripTrailingZeros().toPlainString(), effMinNotional.toPlainString());
+                return;
             }
         }
 
@@ -563,38 +555,26 @@ public class MexcTradeService {
         params.put("symbol", symbol);
         params.put("side", "SELL");
         params.put("type", "MARKET");
-        // ВАЖНО: НИКАКИХ setScale(5)! Только кратность stepSize и "чистая" строка.
         params.put("quantity", normQty.toPlainString());
 
         signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
     }
-
 
     public void forceMarketSellAccountA(String symbol, BigDecimal qty, Long chatId) {
         var creds = MemoryDb.getAccountA(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
 
-        SymbolFilters f = getSymbolFilters(symbol);
-        BigDecimal normQty = normalizeQty(qty, f);
-        if (normQty.signum() <= 0) {
-            log.warn("forceMarketSellAccountA {}: qty <= 0 после нормализации (raw={})",
-                    symbol, qty == null ? "null" : qty.stripTrailingZeros().toPlainString());
-            return;
-        }
-
         Map<String, String> params = new LinkedHashMap<>();
         params.put("symbol", symbol);
         params.put("side", "SELL");
         params.put("type", "MARKET");
-        params.put("quantity", normQty.toPlainString());
+        params.put("quantity", qty.setScale(5, RoundingMode.DOWN).toPlainString());
 
         signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
     }
 
-
     // ======= SPREAD helpers =======
 
-    // ⬇️ ЗАМЕНИТЬ ПОЛНОСТЬЮ getNearLowerSpreadPrice
     public BigDecimal getNearLowerSpreadPrice(String symbol) {
         try {
             String url = API_BASE + TICKER_BOOK + "?symbol=" + symbol;
@@ -604,38 +584,31 @@ public class MexcTradeService {
             BigDecimal bid = new BigDecimal(resp.path("bidPrice").asText("0"));
             BigDecimal ask = new BigDecimal(resp.path("askPrice").asText("0"));
 
-            SymbolFilters f = getSymbolFilters(symbol);
-            BigDecimal tick = f.tickSize.signum() > 0 ? f.tickSize : new BigDecimal("0.00000001");
-
-            // фолбэки
             if (bid.signum() <= 0 && ask.signum() > 0) bid = ask;
-            if (ask.signum() <= 0 && bid.signum() > 0) ask = bid;
-            if (bid.signum() <= 0 && ask.signum() <= 0) {
-                log.warn("Пустой стакан {} — возвращаю 1 тик: {}", symbol, tick);
-                return tick;
+            else if (ask.signum() <= 0 && bid.signum() > 0) ask = bid;
+            else if (bid.signum() <= 0 && ask.signum() <= 0) {
+                SymbolFilters f = getSymbolFilters(symbol);
+                BigDecimal p = f.tickSize.signum() > 0 ? f.tickSize : new BigDecimal("0.00000001");
+                log.warn("Пустой стакан {} — возвращаю 1 тик: {}", symbol, p);
+                return p;
             }
 
             BigDecimal spread = ask.subtract(bid);
             if (spread.signum() < 0) spread = BigDecimal.ZERO;
 
-            // целим на нижнюю часть спреда: bid + 10% спреда
             BigDecimal raw = bid.add(spread.multiply(new BigDecimal("0.10")));
-            BigDecimal norm = normalizePrice(raw, f);
+            SymbolFilters f = getSymbolFilters(symbol);
+            BigDecimal price = normalizePrice(raw, f);
 
-            // КЛАМП: цену SELL не опускаем ниже bid+tick и не поднимаем к ask
-            BigDecimal clamped = clampForSide(bid, ask, tick, norm, "SELL");
-
-            log.info("getNearLowerSpreadPrice[{}]: bid={} ask={} spread={} raw={} -> norm={} -> clamped={} (tickSize={})",
-                    symbol,
-                    bid.stripTrailingZeros().toPlainString(),
+            log.info("getNearLowerSpreadPrice[{}]: bid={} ask={} spread={} raw={} -> normalized={} (tickSize={})",
+                    symbol, bid.stripTrailingZeros().toPlainString(),
                     ask.stripTrailingZeros().toPlainString(),
                     spread.stripTrailingZeros().toPlainString(),
                     raw.stripTrailingZeros().toPlainString(),
-                    norm.toPlainString(),
-                    clamped.toPlainString(),
-                    tick.stripTrailingZeros().toPlainString());
+                    price.toPlainString(),
+                    f.tickSize.stripTrailingZeros().toPlainString());
 
-            return clamped;
+            return price;
         } catch (Exception e) {
             log.error("Ошибка получения стакана для {}: {}", symbol, e.getMessage(), e);
             SymbolFilters f = getSymbolFilters(symbol);
@@ -643,7 +616,6 @@ public class MexcTradeService {
         }
     }
 
-    // ⬇️ ЗАМЕНИТЬ ПОЛНОСТЬЮ getNearUpperSpreadPrice
     public BigDecimal getNearUpperSpreadPrice(String symbol) {
         try {
             String url = API_BASE + TICKER_BOOK + "?symbol=" + symbol;
@@ -653,38 +625,32 @@ public class MexcTradeService {
             BigDecimal bid = new BigDecimal(resp.path("bidPrice").asText("0"));
             BigDecimal ask = new BigDecimal(resp.path("askPrice").asText("0"));
 
-            SymbolFilters f = getSymbolFilters(symbol);
-            BigDecimal tick = f.tickSize.signum() > 0 ? f.tickSize : new BigDecimal("0.00000001");
-
-            // фолбэки
             if (bid.signum() <= 0 && ask.signum() > 0) bid = ask;
-            if (ask.signum() <= 0 && bid.signum() > 0) ask = bid;
-            if (bid.signum() <= 0 && ask.signum() <= 0) {
-                log.warn("Пустой стакан {} — возвращаю 1 тик (upper): {}", symbol, tick);
-                return tick;
+            else if (ask.signum() <= 0 && bid.signum() > 0) ask = bid;
+            else if (bid.signum() <= 0 && ask.signum() <= 0) {
+                SymbolFilters f = getSymbolFilters(symbol);
+                BigDecimal p = f.tickSize.signum() > 0 ? f.tickSize : new BigDecimal("0.00000001");
+                log.warn("Пустой стакан {} — возвращаю 1 тик (upper): {}", symbol, p);
+                return p;
             }
 
             BigDecimal spread = ask.subtract(bid);
             if (spread.signum() < 0) spread = BigDecimal.ZERO;
 
-            // целим на верхнюю часть спреда: ask - 10% спреда
             BigDecimal raw = ask.subtract(spread.multiply(new BigDecimal("0.10")));
-            BigDecimal norm = normalizePrice(raw, f);
+            SymbolFilters f = getSymbolFilters(symbol);
+            BigDecimal price = normalizePrice(raw, f);
 
-            // КЛАМП: цену BUY не поднимаем выше ask-tick и не опускаем ниже bid
-            BigDecimal clamped = clampForSide(bid, ask, tick, norm, "BUY");
-
-            log.info("getNearUpperSpreadPrice[{}]: bid={} ask={} spread={} raw={} -> norm={} -> clamped={} (tickSize={})",
+            log.info("getNearUpperSpreadPrice[{}]: bid={} ask={} spread={} raw={} -> normalized={} (tickSize={})",
                     symbol,
                     bid.stripTrailingZeros().toPlainString(),
                     ask.stripTrailingZeros().toPlainString(),
                     spread.stripTrailingZeros().toPlainString(),
                     raw.stripTrailingZeros().toPlainString(),
-                    norm.toPlainString(),
-                    clamped.toPlainString(),
-                    tick.stripTrailingZeros().toPlainString());
+                    price.toPlainString(),
+                    f.tickSize.stripTrailingZeros().toPlainString());
 
-            return clamped;
+            return price;
         } catch (Exception e) {
             log.error("Ошибка получения стакана (upper) для {}: {}", symbol, e.getMessage(), e);
             SymbolFilters f = getSymbolFilters(symbol);
@@ -692,15 +658,12 @@ public class MexcTradeService {
         }
     }
 
-    /**
-     * Округляет value ВНИЗ до ближайшего кратного step (floor к сетке).
-     * Работает корректно даже при очень малых шагах (1e-9 и т.д.).
-     */
+    // ======= Тех. методы =======
+
+    /** Округляет value ВНИЗ до ближайшего кратного step (floor к сетке). */
     private static BigDecimal floorToStep(BigDecimal value, BigDecimal step) {
         if (value == null || step == null || step.signum() <= 0) return value;
         if (value.signum() <= 0) return BigDecimal.ZERO;
-
-        // value = floor(value / step) * step
         BigDecimal multiples = value.divide(step, 0, RoundingMode.DOWN);
         return multiples.multiply(step);
     }
@@ -709,7 +672,6 @@ public class MexcTradeService {
     private static BigDecimal normalizePrice(BigDecimal rawPrice, SymbolFilters f) {
         BigDecimal p = floorToStep(rawPrice, f.tickSize);
         if (p == null || p.signum() <= 0) {
-            // fallback: минимально допустимая положительная цена = один тик
             p = f.tickSize.signum() > 0 ? f.tickSize : new BigDecimal("0.00000001");
         }
         return p.stripTrailingZeros();
@@ -720,21 +682,18 @@ public class MexcTradeService {
         BigDecimal q = floorToStep(rawQty, f.stepSize);
         if (q == null) q = BigDecimal.ZERO;
 
-        // не даём уйти ниже minQty, если оно задано и у нас достаточно сырого объёма
         if (f.minQty.signum() > 0 && q.signum() > 0 && q.compareTo(f.minQty) < 0) {
-            // попробуем подтянуть до minQty вверх к кратности stepSize
             BigDecimal neededMultiples = f.minQty.divide(f.stepSize, 0, RoundingMode.CEILING);
             q = neededMultiples.multiply(f.stepSize);
-            // если подняли больше, чем есть реально на балансе — всё равно поставим вниз (q может стать 0)
             if (q.compareTo(rawQty) > 0) {
                 q = floorToStep(rawQty, f.stepSize);
             }
         }
-
         return q.stripTrailingZeros();
     }
 
     /** Грубо проверяем notional, если фильтр присутствует (может отсутствовать на MEXC). */
+    @SuppressWarnings("unused")
     private static boolean satisfiesNotional(BigDecimal price, BigDecimal qty, SymbolFilters f) {
         if (f.minNotional.signum() <= 0) return true;
         if (price == null || qty == null) return false;
@@ -742,12 +701,10 @@ public class MexcTradeService {
         return notional.compareTo(f.minNotional) >= 0;
     }
 
-    /** Достаём фильтры символа из кэша/сети. */
     /** Получить фильтры символа (с кэшем) */
     private SymbolFilters getSymbolFilters(String symbol) {
         long now = System.currentTimeMillis();
 
-        // кэш
         CachedSymbolInfo cached = exchangeInfoCache.get(symbol);
         if (cached != null && (now - cached.loadedAt) < EXCHANGE_INFO_TTL_MS) {
             return cached.filters;
@@ -761,7 +718,6 @@ public class MexcTradeService {
             JsonNode symbols = json.get("symbols");
             if (symbols == null || !symbols.isArray() || symbols.isEmpty()) {
                 log.warn("exchangeInfo: пустой symbols для {}", symbol);
-                // дефолтные шаги — лучше, чем ничего
                 SymbolFilters def = new SymbolFilters(
                         new BigDecimal("0.00000001"),
                         BigDecimal.ONE,
@@ -775,7 +731,6 @@ public class MexcTradeService {
 
             JsonNode s0 = symbols.get(0);
 
-            // --- парсим quotePrecision / quoteAssetPrecision
             Integer quotePrecision = null;
             if (s0.has("quotePrecision")) {
                 quotePrecision = s0.get("quotePrecision").asInt();
@@ -783,7 +738,6 @@ public class MexcTradeService {
                 quotePrecision = s0.get("quoteAssetPrecision").asInt();
             }
 
-            // --- фильтры
             BigDecimal tickSize = null;
             BigDecimal stepSize = null;
             BigDecimal minQty   = null;
@@ -794,9 +748,7 @@ public class MexcTradeService {
                 for (JsonNode f : filters) {
                     String type = f.path("filterType").asText("");
                     switch (type) {
-                        case "PRICE_FILTER" -> {
-                            tickSize = new BigDecimal(f.path("tickSize").asText("0.00000001"));
-                        }
+                        case "PRICE_FILTER" -> tickSize = new BigDecimal(f.path("tickSize").asText("0.00000001"));
                         case "LOT_SIZE" -> {
                             stepSize = new BigDecimal(f.path("stepSize").asText("1"));
                             minQty   = new BigDecimal(f.path("minQty").asText("0"));
@@ -812,13 +764,12 @@ public class MexcTradeService {
                 }
             }
 
-            // --- дефолты
             if (tickSize == null) tickSize = new BigDecimal("0.00000001");
             if (stepSize == null) stepSize = BigDecimal.ONE;
             if (minQty == null)   minQty   = BigDecimal.ZERO;
             if (minNotional == null) minNotional = BigDecimal.ZERO;
             if (quotePrecision == null) {
-                quotePrecision = symbol.endsWith("USDT") ? 6 : 8; // разумный дефолт
+                quotePrecision = symbol.endsWith("USDT") ? 6 : 8;
             }
 
             SymbolFilters parsed = new SymbolFilters(tickSize, stepSize, minQty, minNotional, quotePrecision);
@@ -848,13 +799,11 @@ public class MexcTradeService {
         }
     }
 
-
     /** Сколько знаков допустимо у quote (USDT) для данного символа. */
     private static int resolveQuoteScale(String symbol, SymbolFilters f) {
         if (f != null && f.quotePrecision != null && f.quotePrecision > 0) {
             return f.quotePrecision;
         }
-        // дефолт: USDT — 6, иное — 8
         return (symbol != null && symbol.endsWith("USDT")) ? 6 : 8;
     }
 
@@ -865,14 +814,13 @@ public class MexcTradeService {
         return amount.setScale(quoteScale, RoundingMode.DOWN).stripTrailingZeros();
     }
 
-
-    // -- Модель результата ордера (фактическое исполнение)
+    // -- Модель результата ордера
     public record OrderInfo(
             String orderId,
             String status,               // NEW / PARTIALLY_FILLED / FILLED / CANCELED / REJECTED
             BigDecimal executedQty,      // сколько базовой монеты реально исполнено
             BigDecimal cummQuoteQty,     // сколько USDT списано/получено фактически
-            BigDecimal avgPrice          // средняя цена (безопасно делим cummQuoteQty / executedQty)
+            BigDecimal avgPrice          // средняя цена (cummQuoteQty / executedQty)
     ) {}
 
     private static BigDecimal bd(String s) { return new BigDecimal(s).stripTrailingZeros(); }
@@ -882,7 +830,7 @@ public class MexcTradeService {
                 : quote.divide(base, 12, RoundingMode.HALF_UP).stripTrailingZeros();
     }
 
-    // -- Ждём пока ордер станет FILLED/CANCELED/REJECTED, краткий backoff
+    // -- Ждём пока ордер станет финальным
     OrderInfo waitUntilFilled(String symbol, String orderId, String apiKey, String secret, long timeoutMs) {
         long deadline = System.currentTimeMillis() + timeoutMs;
         long[] sleeps = {150, 300, 600, 900, 1200};
@@ -916,7 +864,7 @@ public class MexcTradeService {
     // -- Эффективный minNotional: если биржа не отдала, используем дефолт для USDT-пар
     private static BigDecimal resolveMinNotional(String symbol, BigDecimal exMinNotional) {
         if (exMinNotional != null && exMinNotional.compareTo(BigDecimal.ZERO) > 0) return exMinNotional;
-        return (symbol != null && symbol.endsWith("USDT")) ? BigDecimal.ONE : BigDecimal.ZERO; // 1 USDT дефолт
+        return (symbol != null && symbol.endsWith("USDT")) ? BigDecimal.ONE : BigDecimal.ZERO;
     }
 
     // -- Минимально допустимое qty при заданной цене под minNotional (кратно stepSize)
@@ -929,41 +877,21 @@ public class MexcTradeService {
         BigDecimal k = units.divide(stepSize, 0, RoundingMode.UP);
         return k.multiply(stepSize).stripTrailingZeros();
     }
-    // ⬇️ Вставить в MexcTradeService (рядом с normalize*), общий helper для зажима цены в пределах спреда
-    private static BigDecimal clampForSide(BigDecimal bid,
-                                           BigDecimal ask,
-                                           BigDecimal tick,
-                                           BigDecimal price,
-                                           String side /* "SELL" | "BUY" */) {
-        if (tick == null || tick.signum() <= 0) tick = new BigDecimal("0.00000001");
-        if (bid == null) bid = BigDecimal.ZERO;
-        if (ask == null || ask.signum() <= 0) return (price != null ? price : tick);
 
-        // коридор для цены: [bid+tick, ask-tick]
-        BigDecimal min = bid.add(tick);
-        BigDecimal max = ask.subtract(tick);
+    // ======= Fee helpers =======
 
-        // если спред слишком узкий (или схлопнулся) — ставим около середины и на сетку
-        if (max.compareTo(min) <= 0) {
-            BigDecimal mid = bid.add(ask).divide(new BigDecimal("2"), 18, RoundingMode.HALF_UP);
-            BigDecimal p = floorToStep(mid, tick);
-            if (p.signum() <= 0) p = tick;
-            return p.stripTrailingZeros();
-        }
-
-        BigDecimal p = (price == null || price.signum() <= 0) ? min : price;
-
-        // SELL не должен быть ниже bid+tick; BUY не должен быть выше ask-tick
-        if ("SELL".equalsIgnoreCase(side)) {
-            p = p.max(min);
-        } else {
-            p = p.min(max);
-        }
-
-        // приведение к сетке после зажима
-        p = floorToStep(p, tick);
-        if (p.signum() <= 0) p = tick;
-        return p.stripTrailingZeros();
+    /** Накидываем комиссию (для требуемой суммы): amount * (1 + fee + safety). */
+    private static BigDecimal addFeeUp(BigDecimal amount, BigDecimal fee, BigDecimal safety) {
+        if (amount == null) return BigDecimal.ZERO;
+        BigDecimal k = BigDecimal.ONE.add(fee).add(safety);
+        return amount.multiply(k);
     }
 
+    /** Резерв под комиссию (для бюджета): amount * (1 - fee - safety). */
+    public BigDecimal reserveForMakerFee(BigDecimal amount) {
+        if (amount == null) return BigDecimal.ZERO;
+        BigDecimal k = BigDecimal.ONE.subtract(MAKER_FEE).subtract(FEE_SAFETY);
+        if (k.compareTo(BigDecimal.ZERO) <= 0) k = new BigDecimal("0.99");
+        return amount.multiply(k);
+    }
 }
