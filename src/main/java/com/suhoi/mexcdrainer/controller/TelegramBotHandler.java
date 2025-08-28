@@ -105,7 +105,7 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
 
                 tg.reply(chatId, "▶️ Запускаю перелив: %s на %.4f USDT".formatted(symbol, usdt));
                 // Выполняем синхронно (при желании можно вынести в отдельный executor)
-                drainService.startDrain(symbol, usdt, chatId, 5);
+                drainService.startDrain(symbol, usdt, chatId, 20);
                 return;
             }
 

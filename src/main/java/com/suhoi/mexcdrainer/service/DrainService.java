@@ -1,5 +1,6 @@
 package com.suhoi.mexcdrainer.service;
 
+import com.suhoi.mexcdrainer.util.MemoryDb;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -28,21 +29,25 @@ public class DrainService {
         try {
             log.info("🚀 Запуск перелива: символ={}, сумма={} USDT", symbol, usdtAmount);
 
-            // 1️⃣ На A покупаем токены на usdtAmount
-            mexcTradeService.marketBuyAccountA(symbol, usdtAmount, chatId);
-            // Получаем сколько реально купили токенов
-            BigDecimal qtyTokens = mexcTradeService.getTokenBalanceAccountA(symbol, chatId);
-            log.info("A ➡ Купил на {} USDT, получил {} токенов", usdtAmount, qtyTokens);
+            // 1) MARKET BUY A (берём фактическое executedQty)
+            MexcTradeService.OrderInfo buyA = mexcTradeService.marketBuyAccountAFull(symbol, usdtAmount, chatId);
+            if (buyA == null || buyA.executedQty().signum() <= 0) {
+                log.error("A ➡ Market BUY не дал executedQty. Статус={}", buyA == null ? "null" : buyA.status());
+                return;
+            }
+            BigDecimal qtyTokens = buyA.executedQty();
+            log.info("A ➡ Купил на {} USDT, получил {} токенов (avg={})",
+                    buyA.cummQuoteQty().stripTrailingZeros().toPlainString(),
+                    qtyTokens.stripTrailingZeros().toPlainString(),
+                    buyA.avgPrice().stripTrailingZeros().toPlainString()
+            );
 
-            // 2️⃣ Крутим цикл несколько раз
+            // 2) Циклы
             for (int i = 0; i < cycles; i++) {
                 log.info("🔄 Цикл {}/{}", i + 1, cycles);
-                executeCycle(symbol, qtyTokens, chatId);
-
-                // можно уточнять qtyTokens каждый раз с биржи, чтобы не накапливалась погрешность
-                qtyTokens = mexcTradeService.getTokenBalanceAccountB(symbol, chatId);
-                if (qtyTokens.compareTo(BigDecimal.ZERO) <= 0) {
-                    log.warn("⚠ У B закончились токены, прерываем перелив");
+                qtyTokens = executeCycle(symbol, qtyTokens, chatId); // вернём фактический nextQty
+                if (qtyTokens == null || qtyTokens.compareTo(BigDecimal.ZERO) <= 0) {
+                    log.warn("⚠ Следующий объём для цикла <= 0 — останавливаемся");
                     break;
                 }
             }
@@ -52,35 +57,91 @@ public class DrainService {
         }
     }
 
+
     /**
-     * Один цикл перелива (с реальными балансами)
+     * Один цикл перелива, возвращает фактическое количество токенов A после лимитной покупки.
      *
-     * @param symbol   тикер
-     * @param chatId   id чата
+     * @param symbol    тикер
+     * @param qtyTokens сколько токенов продаём изначально (равно фактическому количеству A из прошлого шага)
+     * @param chatId    телеграм чат
+     * @return фактически купленное A в конце цикла (executedQty лимитной покупки)
      */
-    private void executeCycle(String symbol, BigDecimal qtyTokens, Long chatId) {
+    private BigDecimal executeCycle(String symbol, BigDecimal qtyTokens, Long chatId) {
         try {
-            // 1️⃣ A продает лимиткой
+            long tCycle = System.currentTimeMillis();
+
+            // 1) A продаёт лимиткой возле нижней границы
             BigDecimal sellPrice = mexcTradeService.getNearLowerSpreadPrice(symbol);
-            mexcTradeService.placeLimitSellAccountA(symbol, sellPrice, qtyTokens, chatId);
-            log.info("A ➡ Выставил лимитный ордер на продажу на сумму {} токенов по цене {}", qtyTokens, sellPrice);
+            String sellOrderId = mexcTradeService.placeLimitSellAccountA(symbol, sellPrice, qtyTokens, chatId);
+            log.info("A ➡ SELL лимитка {} токенов @ {} (orderId={})",
+                    qtyTokens.stripTrailingZeros(), sellPrice.stripTrailingZeros(), sellOrderId);
 
-            // 2️⃣ B покупает ровно столько же
+// если SELL не был размещён — нет смысла продолжать цикл
+            if (sellOrderId == null) {
+                log.warn("A SELL не размещён (minNotional/minQty/входные проверки) — пропускаем цикл");
+                return BigDecimal.ZERO;
+            }
+
+// перед MARKET BUY B — лог плана по USDT (для сверки)
+            BigDecimal plannedQuote = sellPrice.multiply(qtyTokens).setScale(10, RoundingMode.DOWN);
+            log.info("🧮 План для B BUY: цена={} * qty={} ≈ {} USDT",
+                    sellPrice.stripTrailingZeros().toPlainString(),
+                    qtyTokens.stripTrailingZeros().toPlainString(),
+                    plannedQuote.stripTrailingZeros().toPlainString());
+
+// 2) B покупает
             mexcTradeService.marketBuyFromAccountB(symbol, sellPrice, qtyTokens, chatId);
-            log.info("B ➡ Купил по рынку {} токенов @ {}", qtyTokens, sellPrice);
+            log.info("B ➡ BUY market ~{} токенов @ {} (на сумму ~{})",
+                    qtyTokens.stripTrailingZeros(),
+                    sellPrice.stripTrailingZeros(),
+                    plannedQuote.stripTrailingZeros());
 
-            // 3️⃣ Считаем сколько USDT имеет A
-            BigDecimal usdtEarned = sellPrice.multiply(qtyTokens).setScale(5, RoundingMode.DOWN);
-            log.info("📊 A осталось {} USDT", usdtEarned);
 
-            // 4️⃣ A ставит лимитку на покупку на эту сумму
+            // 3) Дожидаемся FILLED по A-SELL, чтобы взять реальный usdtEarned
+            MexcTradeService.OrderInfo sellAInfo = null;
+            if (sellOrderId != null) {
+                var credsA = MemoryDb.getAccountA(chatId);
+                sellAInfo = mexcTradeService.waitUntilFilled(symbol, sellOrderId, credsA.getApiKey(), credsA.getSecret(), 6000);
+            }
+            if (sellAInfo == null || sellAInfo.executedQty().signum() <= 0) {
+                log.warn("A SELL не FILLED или executedQty=0. Статус={}", sellAInfo == null ? "null" : sellAInfo.status());
+                return BigDecimal.ZERO;
+            }
+            BigDecimal usdtEarned = sellAInfo.cummQuoteQty(); // фактически пришло на A
+            log.info("📊 A получил от SELL {} USDT (executedQty={} @ avg={})",
+                    usdtEarned.stripTrailingZeros(),
+                    sellAInfo.executedQty().stripTrailingZeros(),
+                    sellAInfo.avgPrice().stripTrailingZeros());
+
+            // 4) A выставляет лимитный BUY возле верхней границы на эти деньги
             BigDecimal buyPrice = mexcTradeService.getNearUpperSpreadPrice(symbol);
-            mexcTradeService.placeLimitBuyAccountA(symbol, buyPrice, usdtEarned, chatId);
-            log.info("A ➡ Лимитная покупка на {} USDT @ {}", usdtEarned, buyPrice);
+            String buyOrderId = mexcTradeService.placeLimitBuyAccountA(symbol, buyPrice, usdtEarned, chatId);
+            log.info("A ➡ BUY лимитка на {} USDT @ {} (orderId={})",
+                    usdtEarned.stripTrailingZeros(), buyPrice.stripTrailingZeros(), buyOrderId);
 
-            // 5️⃣ B продаёт обратно ровно qtyTokens
+            // 5) B продаёт по рынку исходное количество qtyTokens
             mexcTradeService.marketSellFromAccountB(symbol, buyPrice, qtyTokens, chatId);
-            log.info("B ➡ Продал обратно {} токенов @ {}", qtyTokens, buyPrice);
+            log.info("B ➡ SELL market {} токенов @ {}", qtyTokens.stripTrailingZeros(), buyPrice.stripTrailingZeros());
+
+            // 6) Дожидаемся FILLED по A-BUY, возвращаем фактическое количество на следующий цикл
+            MexcTradeService.OrderInfo buyAInfo = null;
+            if (buyOrderId != null) {
+                var credsA = MemoryDb.getAccountA(chatId);
+                buyAInfo = mexcTradeService.waitUntilFilled(symbol, buyOrderId, credsA.getApiKey(), credsA.getSecret(), 6000);
+            }
+            if (buyAInfo == null || buyAInfo.executedQty().signum() <= 0) {
+                log.warn("A BUY не FILLED или executedQty=0. Статус={}", buyAInfo == null ? "null" : buyAInfo.status());
+                return BigDecimal.ZERO;
+            }
+
+            long dt = System.currentTimeMillis() - tCycle;
+            log.info("✅ Цикл завершён за {} ms. A получил {} токенов (avg={}), потратил {} USDT.",
+                    dt,
+                    buyAInfo.executedQty().stripTrailingZeros().toPlainString(),
+                    buyAInfo.avgPrice().stripTrailingZeros().toPlainString(),
+                    buyAInfo.cummQuoteQty().stripTrailingZeros().toPlainString());
+
+            return buyAInfo.executedQty();
 
         } catch (Exception e) {
             log.error("❌ Ошибка в executeCycle", e);
@@ -92,6 +153,8 @@ public class DrainService {
             } catch (Exception ex) {
                 throw new RuntimeException(ex);
             }
+            return BigDecimal.ZERO;
         }
     }
+
 }
