@@ -181,7 +181,7 @@ public class MexcTradeService {
 
     // ======= ORDERS =======
 
-    // Рынок BUY A с FULL-ответом (+дожидание при необходимости)
+// Рынок BUY A с FULL-ответом (+ожидание); если не FILLED — фолбэк лимиткой НАД спредом
     public OrderInfo marketBuyAccountAFull(String symbol, BigDecimal usdtAmount, Long chatId) {
         var creds = MemoryDb.getAccountA(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
@@ -207,10 +207,23 @@ public class MexcTradeService {
         log.info("✔️ Market BUY A {}#{}: status={}, executedQty={}, cummQuoteQty={}, avg={}, latency={}ms",
                 symbol, orderId, status, executed.toPlainString(), cummQ.toPlainString(), avg.toPlainString(), (t1 - t0));
 
-        if (!"FILLED".equals(status)) {
-            return waitUntilFilled(symbol, orderId, creds.getApiKey(), creds.getSecret(), 5000);
+        // Если не FILLED — подождём чуть-чуть (есть уже реализованная логика)
+        OrderInfo waited = ("FILLED".equals(status))
+                ? new OrderInfo(orderId, status, executed, cummQ, avg)
+                : waitUntilFilled(symbol, orderId, creds.getApiKey(), creds.getSecret(), 5000);
+
+        // Успех — выходим
+        if ("FILLED".equals(waited.status())) return waited;
+
+        // Если ничего не исполнилось — аккуратно отменим и включим фолбэк
+        if (waited.executedQty().compareTo(BigDecimal.ZERO) == 0) {
+            tryCancelOrder(symbol, orderId, creds.getApiKey(), creds.getSecret());
+            log.warn("⚠️ Market BUY A {} не дал FILLED (status={}). Делаю фолбэк: LIMIT над спредом.", symbol, waited.status());
+            return limitBuyAboveSpreadAccountA(symbol, usdtAmount, chatId);
         }
-        return new OrderInfo(orderId, status, executed, cummQ, avg);
+
+        // Частичное исполнение — возвращаем как есть (не добираем остаток, чтобы не «перекупить»)
+        return waited;
     }
 
     public String placeLimitSellAccountA(String symbol, BigDecimal price, BigDecimal qty, Long chatId) {
@@ -265,6 +278,99 @@ public class MexcTradeService {
         if (orderId == null) log.warn("placeLimitSellAccountA unexpected response: {}", resp);
         return orderId;
     }
+
+    /**
+     * Агрессивная LIMIT-продажа «ПОД спредом» (эмулирует MARKET SELL).
+     * Ставит цену bid - N*tickSize (по умолчанию N=3) и timeInForce=IOC.
+     * Возвращает итоговый статус, по возможности дожидаясь финала коротким ожиданием.
+     */
+    public OrderInfo limitSellBelowSpreadAccountB(String symbol, BigDecimal requestedQty, Long chatId) {
+        var creds = MemoryDb.getAccountB(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
+
+        SymbolFilters f = getSymbolFilters(symbol);
+        BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
+
+        // 1) Проверяем доступное количество и нормализуем под шаг
+        String asset = symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4) : symbol;
+        BigDecimal available = getAssetBalance(creds.getApiKey(), creds.getSecret(), asset);
+        if (available.signum() <= 0) {
+            log.warn("LIMIT SELL[AGGR] {}: у B нет доступных токенов ({})", symbol, asset);
+            return new OrderInfo(null, "REJECTED", BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
+        }
+        BigDecimal req = (requestedQty == null) ? BigDecimal.ZERO : requestedQty;
+        BigDecimal capped = req.compareTo(available) <= 0 ? req : available;
+        BigDecimal qty = normalizeQty(capped, f);
+        if (qty.signum() <= 0) {
+            log.warn("LIMIT SELL[AGGR] {}: qty<=0 после нормализации (requested={}, available={}, stepSize={})",
+                    symbol, req.stripTrailingZeros(), available.stripTrailingZeros(), f.stepSize.stripTrailingZeros());
+            return new OrderInfo(null, "REJECTED", BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
+        }
+
+        // 2) Цена ПОД спредом — несколько тиков ниже bid
+        final int ticksBelow = 3;
+        BigDecimal price = priceBelowBid(symbol, ticksBelow);
+
+        // 3) Проверяем minNotional: если не дотягиваем — увеличивать qty нельзя (продаём только то, что есть)
+        if (effMinNotional.signum() > 0) {
+            BigDecimal estNotional = price.multiply(qty);
+            if (estNotional.compareTo(effMinNotional) < 0) {
+                log.warn("LIMIT SELL[AGGR] {}: estNotional={} < minNotional(eff)={}, ордер НЕ отправлен.",
+                        symbol,
+                        estNotional.stripTrailingZeros().toPlainString(),
+                        effMinNotional.stripTrailingZeros().toPlainString());
+                return new OrderInfo(null, "REJECTED", BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
+            }
+        }
+
+        BigDecimal notional = price.multiply(qty);
+        log.info("🔻 LIMIT SELL[AGGR] {}: placing IOC | price={} (под спредом, -{} тика) | qty={} | notional~{}",
+                symbol,
+                price.stripTrailingZeros().toPlainString(),
+                ticksBelow,
+                qty.stripTrailingZeros().toPlainString(),
+                notional.stripTrailingZeros().toPlainString());
+
+        // 4) Отправляем LIMIT IOC; если биржа не примет IOC — ретрай GTC
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "SELL");
+        params.put("type", "LIMIT");
+        params.put("timeInForce", "IOC");
+        params.put("quantity", qty.toPlainString());
+        params.put("price",    price.toPlainString());
+        params.put("newOrderRespType", "FULL");
+
+        JsonNode resp;
+        try {
+            resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
+        } catch (RuntimeException ex) {
+            String msg = ex.getMessage() != null ? ex.getMessage().toLowerCase() : "";
+            if (msg.contains("timeinforce")) {
+                log.warn("LIMIT SELL[AGGR] {}: биржа не приняла IOC, пробую GTC", symbol);
+                params.put("timeInForce", "GTC");
+                resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
+            } else {
+                throw ex;
+            }
+        }
+
+        String orderId = resp.path("orderId").asText(null);
+        String status  = resp.path("status").asText("UNKNOWN");
+        BigDecimal executed = bd(resp.path("executedQty").asText("0"));
+        BigDecimal cummQ    = bd(resp.path("cummulativeQuoteQty").asText("0"));
+        BigDecimal avg      = safeAvg(cummQ, executed);
+
+        log.info("📤 LIMIT SELL[AGGR] {}#{} result: status={}, executedQty={}, cummQuoteQty={}, avg={}",
+                symbol, orderId, status, executed.toPlainString(), cummQ.toPlainString(), avg.toPlainString());
+
+        // 5) Если не финально — коротко подождём
+        if (!"FILLED".equals(status) && !"CANCELED".equals(status) && !"REJECTED".equals(status)) {
+            return waitUntilFilled(symbol, orderId, creds.getApiKey(), creds.getSecret(), 3000);
+        }
+        return new OrderInfo(orderId, status, executed, cummQ, avg);
+    }
+
 
     // --- BUY A: перегрузка с ограничением максимального количества (под B SELL)
     public String placeLimitBuyAccountA(String symbol, BigDecimal price, BigDecimal usdtAmount, BigDecimal maxQty, Long chatId) {
@@ -503,25 +609,33 @@ public class MexcTradeService {
     }
 
     // MARKET SELL B — теперь используем ровно планируемое количество
+    // MARKET SELL B — теперь с FULL-ответом, ожиданием и фолбэком лимиткой ПОД спредом (IOC)
     public void marketSellFromAccountB(String symbol, BigDecimal price, BigDecimal qty, Long chatId) {
         var creds = MemoryDb.getAccountB(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
 
         SymbolFilters f = getSymbolFilters(symbol);
 
+        // 1) Доступный баланс и нормализация количества
         String asset = symbol.endsWith("USDT") ? symbol.substring(0, symbol.length() - 4) : symbol;
         BigDecimal available = getAssetBalance(creds.getApiKey(), creds.getSecret(), asset);
-
         if (available.signum() <= 0) {
             log.warn("MARKET SELL {}: у B нет доступных токенов ({})", symbol, asset);
             return;
         }
-
         BigDecimal requested = (qty == null) ? BigDecimal.ZERO : qty;
         BigDecimal capped = requested.compareTo(available) <= 0 ? requested : available;
         BigDecimal normQty = normalizeQty(capped, f);
+        if (normQty.signum() <= 0) {
+            log.warn("MARKET SELL {}: рассчитанное qty <= 0 (requested={}, available={}, stepSize={})",
+                    symbol,
+                    requested.stripTrailingZeros().toPlainString(),
+                    available.stripTrailingZeros().toPlainString(),
+                    f.stepSize.stripTrailingZeros().toPlainString());
+            return;
+        }
 
-        // Проверим minNotional (если задан)
+        // 2) Проверка minNotional при известной «подсказочной» цене
         BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
         if (effMinNotional.signum() > 0 && price != null && price.signum() > 0) {
             BigDecimal estNotional = price.multiply(normQty);
@@ -530,15 +644,6 @@ public class MexcTradeService {
                         symbol, estNotional.stripTrailingZeros().toPlainString(), effMinNotional.toPlainString());
                 return;
             }
-        }
-
-        if (normQty.signum() <= 0) {
-            log.warn("MARKET SELL {}: рассчитанное qty <= 0 (requested={}, available={}, stepSize={})",
-                    symbol,
-                    requested.stripTrailingZeros().toPlainString(),
-                    available.stripTrailingZeros().toPlainString(),
-                    f.stepSize.stripTrailingZeros().toPlainString());
-            return;
         }
 
         log.info("MARKET SELL {}: финальные параметры -> qty={} | requested={} available={} | stepSize={} minQty={} minNotional={}",
@@ -551,14 +656,51 @@ public class MexcTradeService {
                 f.minNotional.stripTrailingZeros().toPlainString()
         );
 
+        // 3) Пробуем MARKET с FULL-ответом
         Map<String, String> params = new LinkedHashMap<>();
         params.put("symbol", symbol);
         params.put("side", "SELL");
         params.put("type", "MARKET");
         params.put("quantity", normQty.toPlainString());
+        params.put("newOrderRespType", "FULL");
 
-        signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
+        JsonNode resp;
+        try {
+            resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
+        } catch (RuntimeException ex) {
+            log.warn("⚠️ MARKET SELL {}: ошибка при отправке MARKET ({}). Делаю фолбэк: LIMIT под спредом.", symbol, ex.getMessage());
+            limitSellBelowSpreadAccountB(symbol, normQty, chatId);
+            return;
+        }
+
+        String orderId = resp.path("orderId").asText(null);
+        String status  = resp.path("status").asText("UNKNOWN");
+        BigDecimal executed = bd(resp.path("executedQty").asText("0"));
+        BigDecimal cummQ    = bd(resp.path("cummulativeQuoteQty").asText("0"));
+        BigDecimal avg      = safeAvg(cummQ, executed);
+
+        log.info("✔️ MARKET SELL {}#{}: status={}, executedQty={}, cummQuoteQty={}, avg={}",
+                symbol, orderId, status, executed.toPlainString(), cummQ.toPlainString(), avg.toPlainString());
+
+        // 4) Если не FILLED — подождём чуть-чуть
+        OrderInfo waited = ("FILLED".equals(status))
+                ? new OrderInfo(orderId, status, executed, cummQ, avg)
+                : waitUntilFilled(symbol, orderId, creds.getApiKey(), creds.getSecret(), 5000);
+
+        // Успех — выходим
+        if ("FILLED".equals(waited.status())) return;
+
+        // Если совсем не исполнилось — отменяем и делаем фолбэк лимиткой ПОД спредом (IOC)
+        if (waited.executedQty().compareTo(BigDecimal.ZERO) == 0) {
+            tryCancelOrder(symbol, orderId, creds.getApiKey(), creds.getSecret());
+            log.warn("⚠️ MARKET SELL {} не дал FILLED (status={}). Делаю фолбэк: LIMIT под спредом.", symbol, waited.status());
+            limitSellBelowSpreadAccountB(symbol, normQty, chatId);
+            return;
+        }
+
+        // Частичный FILLED — оставляем как есть (не дожимаем остаток, чтобы не переселлить)
     }
+
 
     public void forceMarketSellAccountA(String symbol, BigDecimal qty, Long chatId) {
         var creds = MemoryDb.getAccountA(chatId);
@@ -658,7 +800,233 @@ public class MexcTradeService {
         }
     }
 
+    // Внутри MexcTradeService.java — ДОБАВИТЬ:
+
+    public BigDecimal getUsdtBalanceAccountB(Long chatId) {
+        var creds = MemoryDb.getAccountB(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
+        return getAssetBalance(creds.getApiKey(), creds.getSecret(), "USDT");
+    }
+
+    /**
+     * Перегрузка: вернуть фактически выставленный quoteOrderQty (для счётчика).
+     * Старая marketBuyFromAccountB(...) не трогаю.
+     */
+    public BigDecimal marketBuyFromAccountB(String symbol, BigDecimal price, BigDecimal qty, Long chatId, boolean returnSpent) {
+        var creds = MemoryDb.getAccountB(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
+
+        SymbolFilters f = getSymbolFilters(symbol);
+        int quoteScale = resolveQuoteScale(symbol, f);
+
+        BigDecimal requiredUsdt;
+        try {
+            requiredUsdt = addFeeUp(price.multiply(qty), TAKER_FEE, FEE_SAFETY);
+        } catch (Exception ex) {
+            log.warn("Ошибка расчёта requiredUsdt: {}", ex.getMessage(), ex);
+            requiredUsdt = BigDecimal.ZERO;
+        }
+
+        BigDecimal availableUsdt = getAssetBalance(creds.getApiKey(), creds.getSecret(), "USDT");
+        if (availableUsdt.compareTo(BigDecimal.ZERO) <= 0) {
+            log.warn("B не имеет USDT для покупки (available=0)");
+            return BigDecimal.ZERO;
+        }
+
+        BigDecimal quote = normalizeQuoteAmount(requiredUsdt.min(availableUsdt), quoteScale);
+
+        // проверка minNotional
+        BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
+        if (symbol.endsWith("USDT") && quote.compareTo(effMinNotional) < 0) {
+            log.warn("MARKET BUY[B] {}: quote={} < minNotional={} USDT — ордер НЕ отправлен.",
+                    symbol, quote.toPlainString(), effMinNotional.toPlainString());
+            return BigDecimal.ZERO;
+        }
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "BUY");
+        params.put("type", "MARKET");
+        params.put("quoteOrderQty", quote.toPlainString());
+
+        try {
+            signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
+            log.info("MARKET BUY[B] {}: отправил quoteOrderQty={}", symbol, quote.toPlainString());
+            return returnSpent ? quote : BigDecimal.ZERO;
+        } catch (RuntimeException ex) {
+            String msg = ex.getMessage() != null ? ex.getMessage() : "";
+            if (msg.contains("amount scale is invalid") || msg.contains("scale is invalid")) {
+                int[] fallbacks = {Math.min(quoteScale, 8), 6, 4, 2, 0};
+                for (int s : fallbacks) {
+                    if (s == quoteScale) continue;
+                    BigDecimal q2 = normalizeQuoteAmount(requiredUsdt.min(availableUsdt), s);
+                    if (symbol.endsWith("USDT") && q2.compareTo(effMinNotional) < 0) continue;
+                    log.warn("MARKET BUY[B] {}: ретрай с scale={}, quote={}", symbol, s, q2.toPlainString());
+                    params.put("quoteOrderQty", q2.toPlainString());
+                    try {
+                        signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
+                        return returnSpent ? q2 : BigDecimal.ZERO;
+                    } catch (RuntimeException ex2) {
+                        String m2 = ex2.getMessage() != null ? ex2.getMessage() : "";
+                        if (!(m2.contains("amount scale is invalid") || m2.contains("scale is invalid"))) {
+                            throw ex2;
+                        }
+                    }
+                }
+            }
+            throw ex;
+        }
+    }
+
     // ======= Тех. методы =======
+    // --- DTO для открытых ордеров и глубины
+    public record OpenOrder(
+            String orderId,
+            String side,            // "BUY" | "SELL"
+            BigDecimal price,
+            BigDecimal origQty,
+            BigDecimal executedQty
+    ) {
+        public BigDecimal remaining() {
+            if (origQty == null || executedQty == null) return BigDecimal.ZERO;
+            BigDecimal r = origQty.subtract(executedQty);
+            return r.signum() > 0 ? r.stripTrailingZeros() : BigDecimal.ZERO;
+        }
+    }
+
+    public record DepthSnapshot(
+            long lastUpdateId,
+            List<Level> bids,       // убывание цены
+            List<Level> asks        // возрастание цены
+    ) {
+        public record Level(BigDecimal price, BigDecimal qty) {}
+    }
+
+    public record TopOfBook(BigDecimal bid, BigDecimal ask) {}
+
+    // --- Открытые ордера аккаунта A по символу
+    public List<OpenOrder> getOpenOrdersAccountA(String symbol, Long chatId) {
+        var creds = MemoryDb.getAccountA(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
+
+        Map<String, String> p = new LinkedHashMap<>();
+        p.put("symbol", symbol);
+
+        JsonNode resp = signedRequest("GET", API_PREFIX + "/openOrders", p, creds.getApiKey(), creds.getSecret());
+        List<OpenOrder> out = new ArrayList<>();
+        if (resp != null && resp.isArray()) {
+            for (JsonNode n : resp) {
+                String orderId = n.path("orderId").asText(null);
+                String side    = n.path("side").asText(null);
+                BigDecimal price = bd(n.path("price").asText("0"));
+                BigDecimal orig  = bd(n.path("origQty").asText("0"));
+                BigDecimal exec  = bd(n.path("executedQty").asText("0"));
+                out.add(new OpenOrder(orderId, side, price, orig, exec));
+            }
+        }
+        return out;
+    }
+
+    // --- Снимок глубины (REST)
+    public DepthSnapshot getDepth(String symbol, int limit) {
+        try {
+            String url = API_BASE + "/api/v3/depth?symbol=" + symbol + "&limit=" + Math.min(Math.max(limit, 5), 100);
+            String body = restTemplate.getForObject(url, String.class);
+            JsonNode j = objectMapper.readTree(body);
+
+            long u = j.path("lastUpdateId").asLong(0);
+
+            List<DepthSnapshot.Level> bids = new ArrayList<>();
+            JsonNode jb = j.path("bids");
+            if (jb != null && jb.isArray()) {
+                for (JsonNode row : jb) {
+                    BigDecimal price = bd(row.get(0).asText("0"));
+                    BigDecimal qty   = bd(row.get(1).asText("0"));
+                    if (price.signum() > 0 && qty.signum() > 0)
+                        bids.add(new DepthSnapshot.Level(price, qty));
+                }
+            }
+
+            List<DepthSnapshot.Level> asks = new ArrayList<>();
+            JsonNode ja = j.path("asks");
+            if (ja != null && ja.isArray()) {
+                for (JsonNode row : ja) {
+                    BigDecimal price = bd(row.get(0).asText("0"));
+                    BigDecimal qty   = bd(row.get(1).asText("0"));
+                    if (price.signum() > 0 && qty.signum() > 0)
+                        asks.add(new DepthSnapshot.Level(price, qty));
+                }
+            }
+            return new DepthSnapshot(u, bids, asks);
+        } catch (Exception e) {
+            log.warn("getDepth[{}] error: {}", symbol, e.getMessage());
+            return new DepthSnapshot(0L, List.of(), List.of());
+        }
+    }
+
+    /**
+     * Лучший bid/ask БЕЗ учёта собственных лимиток аккаунта A.
+     * Алгоритм: идём по bid (сверху вниз) / ask (снизу вверх), для уровня
+     * вычитаем суммарный остаток собственных ордеров на этой цене; если остатка
+     * у «чужих» > 0 — это наш «ex-self» топ. Иначе берём следующий уровень.
+     */
+    public TopOfBook topExcludingSelf(String symbol, Long chatId, int depthLimit) {
+        DepthSnapshot d = getDepth(symbol, depthLimit);
+        if (d.bids().isEmpty() || d.asks().isEmpty())
+            return new TopOfBook(BigDecimal.ZERO, BigDecimal.ZERO);
+
+        // Собираем остатки собственных BUY/SELL по ценам
+        Map<BigDecimal, BigDecimal> selfBidRest = new HashMap<>();
+        Map<BigDecimal, BigDecimal> selfAskRest = new HashMap<>();
+        for (OpenOrder o : getOpenOrdersAccountA(symbol, chatId)) {
+            BigDecimal r = o.remaining();
+            if (r.signum() <= 0) continue;
+            if ("BUY".equalsIgnoreCase(o.side())) {
+                selfBidRest.merge(o.price(), r, BigDecimal::add);
+            } else if ("SELL".equalsIgnoreCase(o.side())) {
+                selfAskRest.merge(o.price(), r, BigDecimal::add);
+            }
+        }
+
+        BigDecimal bestBid = BigDecimal.ZERO;
+        for (DepthSnapshot.Level lvl : d.bids()) {
+            BigDecimal net = lvl.qty().subtract(selfBidRest.getOrDefault(lvl.price(), BigDecimal.ZERO));
+            if (net.signum() > 0) { bestBid = lvl.price(); break; }
+        }
+
+        BigDecimal bestAsk = BigDecimal.ZERO;
+        for (DepthSnapshot.Level lvl : d.asks()) {
+            BigDecimal net = lvl.qty().subtract(selfAskRest.getOrDefault(lvl.price(), BigDecimal.ZERO));
+            if (net.signum() > 0) { bestAsk = lvl.price(); break; }
+        }
+
+        // Fallback: если весь верх — это только ты
+        if (bestBid.signum() == 0 && !d.bids().isEmpty()) bestBid = d.bids().get(0).price();
+        if (bestAsk.signum() == 0 && !d.asks().isEmpty()) bestAsk = d.asks().get(0).price();
+
+        return new TopOfBook(bestBid, bestAsk);
+    }
+
+    /** Привести цену к сетке тика (floor). Безопасно для BUY/SELL, когда нужно не превышать raw. */
+    public BigDecimal alignPriceFloor(String symbol, BigDecimal rawPrice) {
+        return normalizePrice(rawPrice, getSymbolFilters(symbol));
+    }
+
+    /** Привести цену к «ceil» сетки тика: ближайший допустимый тик НЕ НИЖЕ raw. Удобно для SELL у нижней кромки. */
+    public BigDecimal alignPriceCeil(String symbol, BigDecimal rawPrice) {
+        SymbolFilters f = getSymbolFilters(symbol);
+        BigDecimal p = normalizePrice(rawPrice, f); // floor
+        if (rawPrice != null && p.compareTo(rawPrice) < 0) {
+            p = p.add(f.tickSize);
+            p = normalizePrice(p, f); // перестраховка
+        }
+        return p.stripTrailingZeros();
+    }
+
+    /** Привести количество к сетке шага лота (floor). */
+    public BigDecimal alignQtyFloor(String symbol, BigDecimal rawQty) {
+        return normalizeQty(rawQty, getSymbolFilters(symbol));
+    }
 
     /** Округляет value ВНИЗ до ближайшего кратного step (floor к сетке). */
     private static BigDecimal floorToStep(BigDecimal value, BigDecimal step) {
@@ -894,4 +1262,176 @@ public class MexcTradeService {
         if (k.compareTo(BigDecimal.ZERO) <= 0) k = new BigDecimal("0.99");
         return amount.multiply(k);
     }
+    /** Котировка стакана (best bid/ask) */
+    private record BookTicker(BigDecimal bid, BigDecimal ask) {}
+
+    private BookTicker fetchBookTicker(String symbol) {
+        try {
+            String url = API_BASE + TICKER_BOOK + "?symbol=" + symbol;
+            String body = restTemplate.getForObject(url, String.class);
+            JsonNode resp = objectMapper.readTree(body);
+
+            BigDecimal bid = new BigDecimal(resp.path("bidPrice").asText("0"));
+            BigDecimal ask = new BigDecimal(resp.path("askPrice").asText("0"));
+
+            // Если стакан пустой с одной стороны — зеркалим, чтобы не получить нули
+            if (bid.signum() <= 0 && ask.signum() > 0) bid = ask;
+            if (ask.signum() <= 0 && bid.signum() > 0) ask = bid;
+            if (bid.signum() <= 0 && ask.signum() <= 0) {
+                // Совсем пусто — вернём 1 тик, чтобы не упасть
+                SymbolFilters f = getSymbolFilters(symbol);
+                BigDecimal p = f.tickSize.signum() > 0 ? f.tickSize : new BigDecimal("0.00000001");
+                return new BookTicker(p, p);
+            }
+            return new BookTicker(bid, ask);
+        } catch (Exception e) {
+            log.error("Ошибка чтения bookTicker для {}: {}", symbol, e.getMessage());
+            SymbolFilters f = getSymbolFilters(symbol);
+            BigDecimal p = f.tickSize.signum() > 0 ? f.tickSize : new BigDecimal("0.00000001");
+            return new BookTicker(p, p);
+        }
+    }
+
+    /**
+     * Агрессивная LIMIT-покупка «НАД спредом» (эмулирует MARKET).
+     * Берём ask и ставим цену ask + N*tickSize (по умолчанию N=3).
+     * Отправляем LIMIT IOC (если биржа не примет IOC — пробуем GTC).
+     * Возвращаем OrderInfo с финальным статусом (по возможности).
+     */
+    public OrderInfo limitBuyAboveSpreadAccountA(String symbol, BigDecimal usdtAmount, Long chatId) {
+        var creds = MemoryDb.getAccountA(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
+
+        SymbolFilters f = getSymbolFilters(symbol);
+        BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
+
+        // Цена над спредом — несколько тиков выше ask
+        final int ticksAbove = 3;
+        BigDecimal price = priceAboveAsk(symbol, ticksAbove);
+
+        // Считаем количество «с запасом вниз», чтобы не выйти за бюджет
+        BigDecimal rawQty = BigDecimal.ZERO;
+        try { rawQty = usdtAmount.divide(price, 18, RoundingMode.DOWN); } catch (Exception ignore) {}
+        BigDecimal qty = normalizeQty(rawQty, f);
+
+        // Проверки minQty и minNotional
+        BigDecimal minQtyNeed = minQtyForNotional(price, f.stepSize, effMinNotional);
+        if (qty.compareTo(minQtyNeed) < 0) {
+            BigDecimal needCost = minQtyNeed.multiply(price);
+            if (needCost.compareTo(usdtAmount) <= 0) {
+                qty = minQtyNeed;
+            } else {
+                log.warn("LIMIT BUY[AGGR] {}: бюджет {} USDT < требуемого на minNotional {} (нужно {} USDT). Ордер НЕ отправлен.",
+                        symbol,
+                        usdtAmount.stripTrailingZeros().toPlainString(),
+                        effMinNotional.stripTrailingZeros().toPlainString(),
+                        needCost.stripTrailingZeros().toPlainString());
+                return new OrderInfo(null, "REJECTED", BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
+            }
+        }
+        if (qty.signum() <= 0) {
+            log.warn("LIMIT BUY[AGGR] {}: qty<=0 после расчётов (budget={}, price={}, stepSize={})",
+                    symbol, usdtAmount, price, f.stepSize);
+            return new OrderInfo(null, "REJECTED", BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
+        }
+
+        BigDecimal notional = price.multiply(qty);
+        log.info("🟢 LIMIT BUY[AGGR] {}: placing IOC | price={} (над спредом, +{} тика) | qty={} | notional~{}",
+                symbol,
+                price.stripTrailingZeros().toPlainString(),
+                ticksAbove,
+                qty.stripTrailingZeros().toPlainString(),
+                notional.stripTrailingZeros().toPlainString());
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "BUY");
+        params.put("type", "LIMIT");
+        params.put("timeInForce", "IOC"); // хотим «немедленно или отменить»
+        params.put("quantity", qty.toPlainString());
+        params.put("price",    price.toPlainString());
+        params.put("newOrderRespType", "FULL");
+
+        JsonNode resp;
+        try {
+            resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
+        } catch (RuntimeException ex) {
+            // Если биржа внезапно не принимает IOC — пробуем GTC
+            String msg = ex.getMessage() != null ? ex.getMessage() : "";
+            if (msg.toLowerCase().contains("timeinforce")) {
+                log.warn("LIMIT BUY[AGGR] {}: биржа не приняла IOC, пробую GTC", symbol);
+                params.put("timeInForce", "GTC");
+                resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
+            } else {
+                throw ex;
+            }
+        }
+
+        String orderId = resp.path("orderId").asText(null);
+        String status  = resp.path("status").asText("UNKNOWN");
+
+        BigDecimal executed = bd(resp.path("executedQty").asText("0"));
+        BigDecimal cummQ    = bd(resp.path("cummulativeQuoteQty").asText("0"));
+        BigDecimal avg      = safeAvg(cummQ, executed);
+
+        log.info("📥 LIMIT BUY[AGGR] {}#{} result: status={}, executedQty={}, cummQuoteQty={}, avg={}",
+                symbol, orderId, status, executed.toPlainString(), cummQ.toPlainString(), avg.toPlainString());
+
+        // Если не финально — коротко подождём
+        if (!"FILLED".equals(status) && !"CANCELED".equals(status) && !"REJECTED".equals(status)) {
+            return waitUntilFilled(symbol, orderId, creds.getApiKey(), creds.getSecret(), 3000);
+        }
+        return new OrderInfo(orderId, status, executed, cummQ, avg);
+    }
+
+    /** Цена НАД спредом (для BUY): ask + N * tickSize, округление вниз к сетке (floor) */
+    private BigDecimal priceAboveAsk(String symbol, int ticksAbove) {
+        SymbolFilters f = getSymbolFilters(symbol);
+        BookTicker t = fetchBookTicker(symbol);
+
+        int n = Math.max(1, ticksAbove);
+        BigDecimal raw = t.ask.add(f.tickSize.multiply(BigDecimal.valueOf(n)));
+
+        // floor к сетке тика
+        BigDecimal p = floorToStep(raw, f.tickSize);
+        // гарантия, что действительно выше ask
+        if (p.compareTo(t.ask) <= 0) {
+            p = t.ask.add(f.tickSize);
+            p = floorToStep(p, f.tickSize);
+        }
+        return normalizePrice(p, f);
+    }
+
+    /** Цена ПОД спредом (для SELL): bid - N * tickSize, округление вниз к сетке (floor) */
+    private BigDecimal priceBelowBid(String symbol, int ticksBelow) {
+        SymbolFilters f = getSymbolFilters(symbol);
+        BookTicker t = fetchBookTicker(symbol);
+
+        int n = Math.max(1, ticksBelow);
+        BigDecimal raw = t.bid.subtract(f.tickSize.multiply(BigDecimal.valueOf(n)));
+
+        // так как normalizePrice делает floor, для SELL «ниже bid» этого достаточно
+        BigDecimal p = floorToStep(raw.max(f.tickSize), f.tickSize);
+        // гарантия, что действительно ниже bid
+        if (p.compareTo(t.bid) >= 0) {
+            p = t.bid.subtract(f.tickSize).max(f.tickSize);
+            p = floorToStep(p, f.tickSize);
+        }
+        return normalizePrice(p, f);
+    }
+
+    /** Мягкая попытка отмены спотового ордера (чтобы не словить дабл-покупку при фолбэке) */
+    private void tryCancelOrder(String symbol, String orderId, String apiKey, String secret) {
+        if (orderId == null) return;
+        try {
+            Map<String, String> p = new LinkedHashMap<>();
+            p.put("symbol", symbol);
+            p.put("orderId", orderId);
+            signedRequest("DELETE", ORDER_ENDPOINT, p, apiKey, secret);
+            log.warn("❌ Отменил зависший ордер {}#{} перед фолбэком", symbol, orderId);
+        } catch (Exception ex) {
+            log.warn("Не удалось отменить ордер {}#{}: {}", symbol, orderId, ex.getMessage());
+        }
+    }
+
 }
