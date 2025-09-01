@@ -3,17 +3,16 @@ package com.suhoi.mexcdrainer.controller;
 import com.suhoi.mexcdrainer.config.AppProperties;
 import com.suhoi.mexcdrainer.model.Creds;
 import com.suhoi.mexcdrainer.service.DrainService;
+import com.suhoi.mexcdrainer.service.RangeDrainService;
 import com.suhoi.mexcdrainer.service.TelegramService;
 import com.suhoi.mexcdrainer.util.MemoryDb;
 import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.objects.Update;
 
 import java.math.BigDecimal;
 
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 
@@ -22,6 +21,8 @@ import lombok.extern.slf4j.Slf4j;
 @RequiredArgsConstructor
 public class TelegramBotHandler extends TelegramLongPollingBot {
 
+    // ВАЖНО: final => Lombok заинжектит через конструктор
+    private final RangeDrainService rangeDrainService;
     private final DrainService drainService;
     private final AppProperties appProperties;
     private final TelegramService tg;
@@ -46,12 +47,19 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
         try {
             if (text.startsWith("/start")) {
                 tg.reply(chatId, """
-                        Привет! Я бот для перелива USDT через спред на MEXC.
+                        Привет! Я бот для перелива через спред на MEXC.
 
                         Команды:
                         /setA <apiKey> <secretKey> — задать ключи Аккаунта A (С КОТОРОГО переливаем)
                         /setB <apiKey> <secretKey> — задать ключи Аккаунта B (НА КОТОРЫЙ переливаем)
-                        /drain <SYMBOL> <USDT>    — запустить перелив (пример: /drain ANTUSDT 5)
+
+                        Режимы перелива:
+                        1) Простой:   /drain <SYMBOL> <USDT>
+                           пример: /drain ANTUSDT 5
+
+                        2) В диапазоне: /drain <SYMBOL> <LOW> <HIGH> <USDT>
+                           пример: /drain ANTUSDT 0,000010 0,000020 5
+                           Цены можно писать с запятой или точкой.
 
                         ⚠️ Ключи хранятся только в памяти процесса и пропадут при перезапуске.
                         """);
@@ -82,20 +90,7 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
 
             if (text.startsWith("/drain")) {
                 String[] p = text.split("\\s+");
-                if (p.length != 3) {
-                    tg.reply(chatId, "Формат: /drain <SYMBOL> <USDT>\nНапример: /drain ANTUSDT 5");
-                    return;
-                }
-                final String symbol = p[1].toUpperCase();
-                final BigDecimal usdt;
-                double usdtDouble = Double.parseDouble(p[2]);
-                try {
-                    usdt = BigDecimal.valueOf(usdtDouble);
-                } catch (NumberFormatException nfe) {
-                    tg.reply(chatId, "Сумма USDT должна быть числом. Пример: /drain ANTUSDT 5");
-                    return;
-                }
-
+                // Проверим наличие ключей заранее
                 var a = MemoryDb.getAccountA(chatId);
                 var b = MemoryDb.getAccountB(chatId);
                 if (a == null || b == null) {
@@ -103,9 +98,73 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                     return;
                 }
 
-                tg.reply(chatId, "▶️ Запускаю перелив: %s на %.4f USDT".formatted(symbol, usdt));
-                // Выполняем синхронно (при желании можно вынести в отдельный executor)
-                drainService.startDrain(symbol, usdt, chatId, 20);
+                // --- Режим 1: старый (/drain SYMBOL USDT)
+                if (p.length == 3) {
+                    final String symbol = p[1].toUpperCase();
+                    final BigDecimal usdt = parseDecimalSafe(p[2]);
+                    if (usdt == null) {
+                        tg.reply(chatId, "Сумма USDT должна быть числом. Пример: /drain ANTUSDT 5");
+                        return;
+                    }
+                    tg.reply(chatId, "▶️ Запускаю перелив: %s на %s USDT".formatted(symbol, usdt.stripTrailingZeros()));
+                    // Синхронно, как у тебя и было (можно вынести в отдельный executor, если захочешь)
+                    drainService.startDrain(symbol, usdt, chatId, 20);
+                    return;
+                }
+
+                // --- Режим 2: новый диапазон (/drain SYMBOL LOW HIGH USDT)
+                if (p.length == 5) {
+                    final String symbol = p[1].toUpperCase();
+                    final BigDecimal low  = parseDecimalSafe(p[2]);
+                    final BigDecimal high = parseDecimalSafe(p[3]);
+                    final BigDecimal usdt = parseDecimalSafe(p[4]);
+
+                    if (low == null || high == null || usdt == null) {
+                        tg.reply(chatId, """
+                                Некорректные числа.
+                                Формат: /drain <SYMBOL> <LOW> <HIGH> <USDT>
+                                Пример: /drain ANTUSDT 0,000010 0,000020 5
+                                """);
+                        return;
+                    }
+                    if (low.signum() <= 0 || high.signum() <= 0 || low.compareTo(high) >= 0) {
+                        tg.reply(chatId, "Неверный диапазон цен: LOW должен быть > 0 и меньше HIGH.");
+                        return;
+                    }
+                    if (usdt.signum() <= 0) {
+                        tg.reply(chatId, "Сумма USDT должна быть > 0.");
+                        return;
+                    }
+
+                    tg.reply(chatId, "▶️ Диапазонный перелив: %s в [%s .. %s], цель %s USDT"
+                            .formatted(symbol,
+                                    low.stripTrailingZeros().toPlainString(),
+                                    high.stripTrailingZeros().toPlainString(),
+                                    usdt.stripTrailingZeros().toPlainString()));
+
+                    // В отдельном потоке, чтобы не блокировать Telegram LongPolling поток
+                    new Thread(() -> {
+                        try {
+                            rangeDrainService.startDrainInRange(chatId, symbol, low, high, usdt);
+                            tg.reply(chatId, "✅ Перелив по %s завершён.".formatted(symbol));
+                        } catch (Exception e) {
+                            log.error("Ошибка диапазонного перелива", e);
+                            tg.reply(chatId, "❌ Ошибка перелива: " + e.getMessage());
+                        }
+                    }, "drain-range-" + symbol + "-" + chatId).start();
+
+                    return;
+                }
+
+                // Если формат не распознан
+                tg.reply(chatId, """
+                        Неверный формат. Используйте:
+                        /drain <SYMBOL> <USDT>  или
+                        /drain <SYMBOL> <LOW> <HIGH> <USDT>
+                        Примеры:
+                        /drain ANTUSDT 5
+                        /drain ANTUSDT 0,000010 0,000020 5
+                        """);
                 return;
             }
 
@@ -116,5 +175,21 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
             tg.reply(chatId, "❌ Ошибка: " + ex.getMessage());
         }
     }
+
+    // --- Utils ---
+
+    /**
+     * Безопасный парсер десятичных чисел: поддерживает запятую и точку.
+     * Возвращает null при ошибке.
+     */
+    private static BigDecimal parseDecimalSafe(String s) {
+        if (s == null) return null;
+        try {
+            return new BigDecimal(s.trim().replace(',', '.'));
+        } catch (Exception e) {
+            return null;
+        }
+    }
 }
+
 
