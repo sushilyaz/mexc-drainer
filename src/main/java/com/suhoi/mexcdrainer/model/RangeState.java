@@ -8,22 +8,32 @@ import lombok.NoArgsConstructor;
 import java.math.BigDecimal;
 import java.time.Instant;
 
-/**
- * Простейшее, "слепое" состояние диапазонного перелива на чат.
- * НИКАКОГО reconciliation — только то, что нужно для /stop и /continue.
- */
 @Data
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
 public class RangeState {
-    private String symbol;                 // Монета (например, ANTUSDT)
-    private BigDecimal rangeLow;           // Текущий нижний предел
-    private BigDecimal rangeHigh;          // Текущий верхний предел
-    private BigDecimal targetUsdt;         // Изначальная цель перелива в USDT
-    private BigDecimal drainedUsdt;        // Сколько уже перелили (накопительно)
-    private int step;                      // Сколько шагов сделали (для информации)
-    private boolean paused;                // Пауза по /stop
-    private boolean running;               // В процессе (рабочий поток жив)
-    private Instant updatedAt;             // Метка обновления (просто для логов/диагностики)
+    private Long chatId;
+
+    private String symbol;                 // ANTUSDT
+    private BigDecimal rangeLow;           // LOW
+    private BigDecimal rangeHigh;          // HIGH
+
+    private BigDecimal targetUsdt;         // цель перелива
+    private BigDecimal drainedUsdt;        // уже «перелито»
+
+    private int step;                      // кол-во завершённых шагов
+    private boolean paused;                // ручная или авто-пауза
+    private boolean running;               // есть активный цикл
+
+    // фаза и служебки для resume/reconcile:
+    private RangePhase phase;              // где «замерзли»: A_SELL_PLACED / A_BUY_PLACED / IDLE
+    private String aSellOrderId;           // последняя лимитка A SELL
+    private String aBuyOrderId;            // последняя лимитка A BUY
+    private BigDecimal lastPlannedQty;     // плановая qty для текущей итерации
+
+    private PauseReason pausedReason;      // причина паузы (если paused=true)
+    private String pausedDetails;          // кратко, что случилось
+
+    private Instant updatedAt;             // диагностика
 }

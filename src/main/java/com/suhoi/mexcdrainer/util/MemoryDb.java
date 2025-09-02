@@ -6,62 +6,48 @@ import com.suhoi.mexcdrainer.model.RangeState;
 import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.UnaryOperator;
 
-/**
- * Простейшая in-memory "БД".
- * Теперь хранит не только ключи A/B, но и состояние диапазонного перелива на чат.
- */
-public class MemoryDb {
+public final class MemoryDb {
+    private MemoryDb() {}
 
-    private static final Map<Long, Creds> accountA = new ConcurrentHashMap<>();
-    private static final Map<Long, Creds> accountB = new ConcurrentHashMap<>();
-    private static final Map<Long, RangeState> rangeState = new ConcurrentHashMap<>();
+    private static final Map<Long, Creds> A = new ConcurrentHashMap<>();
+    private static final Map<Long, Creds> B = new ConcurrentHashMap<>();
+    private static final Map<Long, RangeState> RANGE = new ConcurrentHashMap<>();
 
-    // ===== Аккаунт A =====
-    public static void setAccountA(Long chatId, Creds creds) {
-        accountA.put(chatId, creds);
-    }
-    public static Creds getAccountA(Long chatId) {
-        return accountA.get(chatId);
-    }
+    public static void setAccountA(long chatId, Creds c) { A.put(chatId, c); }
+    public static void setAccountB(long chatId, Creds c) { B.put(chatId, c); }
+    public static Creds getAccountA(long chatId) { return A.get(chatId); }
+    public static Creds getAccountB(long chatId) { return B.get(chatId); }
 
-    // ===== Аккаунт B =====
-    public static void setAccountB(Long chatId, Creds creds) {
-        accountB.put(chatId, creds);
-    }
-    public static Creds getAccountB(Long chatId) {
-        return accountB.get(chatId);
+    public static void saveNewRangeState(Long chatId, RangeState s) {
+        if (s != null) {
+            s.setChatId(chatId);
+            s.setUpdatedAt(Instant.now());
+            RANGE.put(chatId, s);
+        }
     }
 
-    // ===== Состояние диапазонного перелива =====
     public static RangeState getRangeState(Long chatId) {
-        return rangeState.get(chatId);
+        return RANGE.get(chatId);
     }
 
-    public static void saveNewRangeState(Long chatId, RangeState state) {
-        if (state != null) state.setUpdatedAt(Instant.now());
-        rangeState.put(chatId, state);
-    }
-
-    public static void updateProgress(Long chatId, java.util.function.UnaryOperator<RangeState> updater) {
-        rangeState.compute(chatId, (k, v) -> {
-            RangeState cur = v == null ? new RangeState() : v;
-            RangeState out = updater.apply(cur);
-            if (out != null) out.setUpdatedAt(Instant.now());
-            return out;
+    /** Универсальное атомарное обновление состояния. */
+    public static void updateProgress(Long chatId, UnaryOperator<RangeState> mut) {
+        RANGE.compute(chatId, (k, old) -> {
+            RangeState next = mut.apply(old);
+            if (next != null) next.setUpdatedAt(Instant.now());
+            return next;
         });
     }
 
+    /** Поставить паузу (без отмены ордеров — это обязанность сервиса логики). */
     public static void markPaused(Long chatId) {
         updateProgress(chatId, st -> {
             if (st == null) return null;
             st.setPaused(true);
-            st.setRunning(false); // поток остановится на проверке paused
+            st.setRunning(false);
             return st;
         });
-    }
-
-    public static void clearRangeState(Long chatId) {
-        rangeState.remove(chatId);
     }
 }

@@ -24,6 +24,8 @@ public class MexcTradeService {
 
     private static final String API_BASE = "https://api.mexc.com";
     private static final String API_PREFIX = "/api/v3";
+    // сверху класса
+    private static final boolean LOG_HTTP_GET = false;
 
     private static final String ACCOUNT_ENDPOINT = API_PREFIX + "/account";
     private static final String ORDER_ENDPOINT = API_PREFIX + "/order";
@@ -126,7 +128,10 @@ public class MexcTradeService {
                 default -> HttpMethod.POST;
             };
 
-            log.info("{} https://api.mexc.com{}?{}", httpMethod.name(), path, finalQuery);
+            if (!"GET".equalsIgnoreCase(httpMethod.name()) || LOG_HTTP_GET) {
+                log.info("{} https://api.mexc.com{}?{}", httpMethod.name(), path, finalQuery);
+            } // иначе не логируем GET вовсе
+
             ResponseEntity<String> resp = restTemplate.exchange(API_BASE + path + "?" + finalQuery, httpMethod, entity, String.class);
             return objectMapper.readTree(resp.getBody());
 
@@ -237,7 +242,20 @@ public class MexcTradeService {
     }
 
     // ======= ORDERS =======
+    /** Нормализация количества под stepSize символа (публичный враппер). */
+    public BigDecimal normalizeQtyForSymbol(String symbol, BigDecimal rawQty) {
+        SymbolFilters f = getSymbolFilters(symbol);
+        return normalizeQty(rawQty, f);
+    }
 
+
+    /** Минимальная qty, чтобы SELL @ price удовлетворил minNotional (публичный враппер). */
+    public BigDecimal planSellMinQtyForNotional(String symbol, BigDecimal price) {
+        SymbolFilters f = getSymbolFilters(symbol);
+        BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
+        BigDecimal normPrice = normalizePrice(price, f);
+        return minQtyForNotional(normPrice, f.stepSize, effMinNotional);
+    }
 // Рынок BUY A с FULL-ответом (+ожидание); если не FILLED — фолбэк лимиткой НАД спредом
     public OrderInfo marketBuyAccountAFull(String symbol, BigDecimal usdtAmount, Long chatId) {
         var creds = MemoryDb.getAccountA(chatId);
@@ -1033,8 +1051,8 @@ public class MexcTradeService {
             return new TopOfBook(BigDecimal.ZERO, BigDecimal.ZERO);
 
         // Собираем остатки собственных BUY/SELL по ценам
-        Map<BigDecimal, BigDecimal> selfBidRest = new HashMap<>();
-        Map<BigDecimal, BigDecimal> selfAskRest = new HashMap<>();
+        Map<BigDecimal, BigDecimal> selfBidRest = new java.util.TreeMap<>(BigDecimal::compareTo);
+        Map<BigDecimal, BigDecimal> selfAskRest = new java.util.TreeMap<>(BigDecimal::compareTo);
         for (OpenOrder o : getOpenOrdersAccountA(symbol, chatId)) {
             BigDecimal r = o.remaining();
             if (r.signum() <= 0) continue;
@@ -1055,6 +1073,54 @@ public class MexcTradeService {
         for (DepthSnapshot.Level lvl : d.asks()) {
             BigDecimal net = lvl.qty().subtract(selfAskRest.getOrDefault(lvl.price(), BigDecimal.ZERO));
             if (net.signum() > 0) { bestAsk = lvl.price(); break; }
+        }
+
+        // DEBUG: снимок наших ордеров по ценам (первые 6 позиций)
+        if (log.isDebugEnabled()) {
+            StringBuilder sbA = new StringBuilder("EXSELF[" + symbol + "] self-ASK map: ");
+            int cA = 0;
+            for (var e : selfAskRest.entrySet()) {
+                sbA.append("[p=").append(e.getKey().stripTrailingZeros().toPlainString())
+                        .append(" self=").append(e.getValue().stripTrailingZeros().toPlainString()).append("] ");
+                if (++cA >= 6) break;
+            }
+            StringBuilder sbB = new StringBuilder("EXSELF[" + symbol + "] self-BID map: ");
+            int cB = 0;
+            for (var e : selfBidRest.entrySet()) {
+                sbB.append("[p=").append(e.getKey().stripTrailingZeros().toPlainString())
+                        .append(" self=").append(e.getValue().stripTrailingZeros().toPlainString()).append("] ");
+                if (++cB >= 6) break;
+            }
+            log.debug(sbA.toString());
+            log.debug(sbB.toString());
+
+            // Топ-3 уровней после вычитания нас
+            StringBuilder asksTop = new StringBuilder("EXSELF[" + symbol + "] asks top3:");
+            int i = 0;
+            for (DepthSnapshot.Level lvl : d.asks()) {
+                BigDecimal self = selfAskRest.getOrDefault(lvl.price(), BigDecimal.ZERO);
+                BigDecimal net  = lvl.qty().subtract(self);
+                asksTop.append(" [p=").append(lvl.price().stripTrailingZeros().toPlainString())
+                        .append(" q=").append(lvl.qty().stripTrailingZeros().toPlainString())
+                        .append(" self=").append(self.stripTrailingZeros().toPlainString())
+                        .append(" net=").append(net.max(BigDecimal.ZERO).stripTrailingZeros().toPlainString()).append("]");
+                if (++i >= 3) break;
+            }
+            StringBuilder bidsTop = new StringBuilder("EXSELF[" + symbol + "] bids top3:");
+            i = 0;
+            for (DepthSnapshot.Level lvl : d.bids()) {
+                BigDecimal self = selfBidRest.getOrDefault(lvl.price(), BigDecimal.ZERO);
+                BigDecimal net  = lvl.qty().subtract(self);
+                bidsTop.append(" [p=").append(lvl.price().stripTrailingZeros().toPlainString())
+                        .append(" q=").append(lvl.qty().stripTrailingZeros().toPlainString())
+                        .append(" self=").append(self.stripTrailingZeros().toPlainString())
+                        .append(" net=").append(net.max(BigDecimal.ZERO).stripTrailingZeros().toPlainString()).append("]");
+                if (++i >= 3) break;
+            }
+            log.debug(asksTop.toString());
+            log.debug(bidsTop.toString());
+            log.debug("EXSELF[" + symbol + "] top: bid=" + bestBid.stripTrailingZeros().toPlainString()
+                    + " ask=" + bestAsk.stripTrailingZeros().toPlainString());
         }
 
         // Fallback: если весь верх — это только ты

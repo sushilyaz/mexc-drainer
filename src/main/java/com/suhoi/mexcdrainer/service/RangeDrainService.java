@@ -9,23 +9,20 @@ import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.security.SecureRandom;
+import java.time.Instant;
 import java.util.HexFormat;
+import java.util.Objects;
 
 import static java.math.BigDecimal.ZERO;
 
 /**
- * Перелив USDT в ЗАДАННОМ ценовом диапазоне БЕЗ контроля спреда.
- *
- * Алгоритм шага (повторяет логику обычного DrainService, но с фиксированными ценами из диапазона):
- *   1) A: LIMIT SELL @ low, qty = min(plan, balanceA)  (если токена не хватает — "seed")
- *   2) B: MARKET BUY на ту же qty (чтобы удовлетворить нашу лимитку A)
- *   3) A: LIMIT BUY  @ high на бюджет ≈ qty * high (maxQty = qty, чтобы не перекупить)
- *   4) B: MARKET SELL той же qty (закрываем лимитку A BUY)
- *
- * Цель: перелить примерно targetUsdt (накопительно delta * qty за все шаги),
- * где delta = high - low.
- *
- * ВНИМАНИЕ: Контроля спреда НЕТ — бот просто работает внутри указанного пользователем диапазона.
+ * Перелив USDT в указанном диапазоне.
+ * Ключевые моменты:
+ *  - Планирование объёма на шаг идёт по бюджету шага (в USDT на нижней границе),
+ *    а не по попытке "закрыть цель за 1 шаг".
+ *  - Для tiny-ценовых монет гарантируем минимальную qty (stepSize/minNotional) ≠ 0.
+ *  - Автопауза не отменяет ордера из другого потока (без гонок).
+ *  - Ручные /stop, /continue, /status.
  */
 @Slf4j
 @Service
@@ -33,31 +30,21 @@ import static java.math.BigDecimal.ZERO;
 public class RangeDrainService {
 
     private final MexcTradeService mexc;
+    private final SpreadMonitorService spread;
 
-    /** Пауза между шагами, мс (чтобы не душить API/матчинг). */
+    /** Пауза между шагами, мс (щадим API/матчинг). */
     private static final long STEP_SLEEP_MS = 350L;
 
-    /** Максимум попыток "подсева" при нехватке токена на A. */
-    private static final int SEED_MAX_RETRIES = 3;
-
-    /** Накидка 5% на бюджет под "seed"-покупку (безопасный запас на проскальзывание/комиссии). */
+    /** Накидка к бюджету SEED-покупки (5%). */
     private static final BigDecimal SEED_BUDGET_K = new BigDecimal("1.05");
 
-    /** Служебный id запуска — для удобства в логах. */
-    private static String runId() {
-        byte[] b = new byte[4];
-        new SecureRandom().nextBytes(b);
-        return HexFormat.of().formatHex(b);
-    }
+    /** Верхний лимит бюджета одного шага в USDT на нижней границе (можно вынести в конфиг). */
+    private static final BigDecimal MAX_STEP_BUDGET_USDT = new BigDecimal("3"); // под твои тесты
 
     // =========================================================================================
-    // ПЕРЕГРУЗКИ ПОД ТВОЙ ВЫЗОВ И УДОБСТВО ИСПОЛЬЗОВАНИЯ
+    // Публичные методы под Telegram
     // =========================================================================================
 
-    /**
-     * ТВОЙ ФОРМАТ ВЫЗОВА (из TelegramBotHandler):
-     *   rangeDrainService.startDrainInRange(chatId, symbol, low, high, usdt);
-     */
     public void startDrainInRange(Long chatId,
                                   String symbol,
                                   BigDecimal rangeLow,
@@ -66,25 +53,6 @@ public class RangeDrainService {
         startDrainInRange(symbol, rangeLow, rangeHigh, targetUsdt, chatId, 50);
     }
 
-    /**
-     * Та же перегрузка, но с кастомным лимитом шагов.
-     */
-    public void startDrainInRange(Long chatId,
-                                  String symbol,
-                                  BigDecimal rangeLow,
-                                  BigDecimal rangeHigh,
-                                  BigDecimal targetUsdt,
-                                  int maxSteps) {
-        startDrainInRange(symbol, rangeLow, rangeHigh, targetUsdt, chatId, maxSteps);
-    }
-
-    // =========================================================================================
-    // ОСНОВНОЙ МЕТОД (ядро)
-    // =========================================================================================
-
-    /**
-     * Основной запуск перелива внутри диапазона (без мониторинга спреда).
-     */
     public void startDrainInRange(String symbol,
                                   BigDecimal rangeLow,
                                   BigDecimal rangeHigh,
@@ -92,270 +60,360 @@ public class RangeDrainService {
                                   Long chatId,
                                   int maxSteps) {
 
-        // ---------- Валидация ----------
-        if (symbol == null || rangeLow == null || rangeHigh == null || targetUsdt == null) {
-            throw new IllegalArgumentException("Пустые параметры запуска диапазонного перелива");
-        }
-        MemoryDb.saveNewRangeState(chatId,
-               RangeState.builder()
-                        .symbol(symbol)
-                        .rangeLow(rangeLow)
-                        .rangeHigh(rangeHigh)
-                        .targetUsdt(targetUsdt)
-                        .drainedUsdt(BigDecimal.ZERO)
-                        .step(0)
-                        .paused(false)
-                        .running(true)
-                        .build()
-        );
+        Objects.requireNonNull(symbol, "symbol");
+        Objects.requireNonNull(rangeLow, "rangeLow");
+        Objects.requireNonNull(rangeHigh, "rangeHigh");
+        Objects.requireNonNull(targetUsdt, "targetUsdt");
+
         symbol = symbol.trim().toUpperCase();
-
-        rangeLow  = rangeLow.stripTrailingZeros();
-        rangeHigh = rangeHigh.stripTrailingZeros();
-
-        if (rangeLow.compareTo(ZERO) <= 0 || rangeHigh.compareTo(rangeLow) <= 0) {
-            throw new IllegalArgumentException("Невалидный диапазон цен: " + rangeLow + " .. " + rangeHigh);
+        if (rangeHigh.subtract(rangeLow).signum() <= 0) {
+            throw new IllegalArgumentException("HIGH должно быть строго выше LOW");
         }
-        if (targetUsdt.compareTo(new BigDecimal("0.50")) < 0) {
-            log.warn("⚠️ targetUsdt={} слишком мало — возможны холостые действия.",
-                    targetUsdt.stripTrailingZeros().toPlainString());
-        }
+
+        RangeState init = RangeState.builder()
+                .symbol(symbol)
+                .rangeLow(rangeLow.stripTrailingZeros())
+                .rangeHigh(rangeHigh.stripTrailingZeros())
+                .targetUsdt(targetUsdt)
+                .drainedUsdt(ZERO)
+                .step(0)
+                .paused(false)
+                .running(true)
+                .updatedAt(Instant.now())
+                .build();
+        MemoryDb.saveNewRangeState(chatId, init);
 
         final String rid = runId();
-        final BigDecimal sellPrice = rangeLow;   // низ диапазона
-        final BigDecimal buyPrice  = rangeHigh;  // верх диапазона
-        final BigDecimal delta     = buyPrice.subtract(sellPrice);
+        final BigDecimal sellPrice = init.getRangeLow();
+        final BigDecimal buyPrice  = init.getRangeHigh();
+        final BigDecimal delta     = buyPrice.subtract(sellPrice); // разница границ диапазона
 
-        if (delta.compareTo(ZERO) <= 0) {
-            throw new IllegalArgumentException("Верх диапазона должен быть выше низа (delta <= 0).");
-        }
+        // Монитор спреда: только помечаем paused (без отмены из этого же потока!)
+        SpreadMonitorService.MonitorConfig monCfg = new SpreadMonitorService.MonitorConfig(
+                symbol, sellPrice, buyPrice,
+                java.time.Duration.ofMillis(150),
+                1,          // tickSafety
+                true,       // excludeSelf
+                chatId
+        );
+        final String symFinal = symbol;
+        spread.startMonitor(monCfg, snap -> {
+            setStatus(chatId, "⛔ Вилка вышла из спреда: bid=" + snap.getBid() + ", ask=" + snap.getAsk());
+            requestPause(chatId, symFinal, "Диапазон вышел из спреда (bid=" + snap.getBid() + ", ask=" + snap.getAsk() + ")");
+        });
 
-        log.info("🚀 [{}] RANGE start: symbol={} | range=[{}..{}] | target={} USDT",
+        log.info("🚀 [{}] RANGE start: {} [{}/{}], target={} USDT",
                 rid, symbol,
-                sellPrice.toPlainString(),
-                buyPrice.toPlainString(),
+                sellPrice.toPlainString(), buyPrice.toPlainString(),
                 targetUsdt.stripTrailingZeros().toPlainString());
+        setStatus(chatId, "🚀 Старт RANGE: " + symbol + " [" + sellPrice + ".." + buyPrice + "], цель=" + targetUsdt.stripTrailingZeros());
 
-        BigDecimal drainedUsdt = ZERO; // накопительно «перелито»
-        int step = 0;
+        BigDecimal drainedUsdt = nz(init.getDrainedUsdt());
+        int step = nzInt(init.getStep());
 
-        // ---------- Основной цикл ----------
+        // Основной цикл
         while (drainedUsdt.compareTo(targetUsdt) < 0 && step < Math.max(1, maxSteps)) {
-            var state = MemoryDb.getRangeState(chatId);
-            if (state != null && state.isPaused()) {
-                log.warn("⏸️ [{}] RANGE paused по команде /stop. Шаг={} drained={} / target={}",
-                        rid, step,
-                        drainedUsdt.stripTrailingZeros().toPlainString(),
-                        targetUsdt.stripTrailingZeros().toPlainString());
-                // Просто выходим из метода. НИЧЕГО НЕ ОТМЕНЯЕМ.
-                return;
+            RangeState st = MemoryDb.getRangeState(chatId);
+            if (st == null || st.isPaused()) {
+                log.warn("⏸️ [{}] Остановлено (paused). Выход из цикла.", rid);
+                break;
             }
             step++;
 
-            // Сколько хотим «продать на A» на этом шаге, чтобы приблизиться к цели?
-            // План ≈ floor( (target - drained) / sellPrice )
+            // Сколько ещё нужно "перелить" и какой бюджет на шаг используем
             BigDecimal remaining = targetUsdt.subtract(drainedUsdt);
-            BigDecimal planQty = safeFloor(remaining.divide(sellPrice, 18, RoundingMode.DOWN));
-            if (planQty.compareTo(ZERO) <= 0) {
-                planQty = BigDecimal.ONE; // минимально 1 «шаговая» единица (часто stepSize=1)
+            BigDecimal stepBudget = remaining.min(MAX_STEP_BUDGET_USDT); // ключевой момент
+
+            // Планируем qty по бюджету на нижней границе
+            BigDecimal planQty = floorPositive(divSafe(stepBudget, sellPrice));
+
+            // Гарантируем минимум по шагу/ноционалу
+            BigDecimal minQtyByStep = mexc.normalizeQtyForSymbol(symbol, BigDecimal.ONE); // обычно 1, если stepSize=1
+            if (minQtyByStep.signum() <= 0) minQtyByStep = BigDecimal.ONE;               // страховка
+            BigDecimal minQtyByNotional = mexc.planSellMinQtyForNotional(symbol, sellPrice);
+            BigDecimal minQtyRequired = max(minQtyByStep, minQtyByNotional);
+
+            if (planQty.compareTo(minQtyRequired) < 0) {
+                planQty = minQtyRequired;
             }
 
-            // Текущий баланс токена на A
+            // Учитываем фактический баланс A; при нехватке — SEED до нужного уровня
             BigDecimal balanceA = mexc.getTokenBalanceAccountA(symbol, chatId).stripTrailingZeros();
-
-            // Подсев при нехватке токена на A
             if (balanceA.compareTo(planQty) < 0) {
-                BigDecimal deficit = planQty.subtract(balanceA);
-                if (deficit.compareTo(BigDecimal.ONE) < 0) deficit = BigDecimal.ONE;
-
-                BigDecimal seedBudget = buyPrice.multiply(deficit).multiply(SEED_BUDGET_K);
-                log.info("({}) [{}] SEED: докупаю на A deficitQty={} по бюджету~{} (buyPrice={})",
-                        (step - 1), rid,
-                        deficit.stripTrailingZeros().toPlainString(),
-                        seedBudget.stripTrailingZeros().toPlainString(),
-                        buyPrice.toPlainString());
-
-                boolean seeded = false;
-                for (int tr = 1; tr <= SEED_MAX_RETRIES; tr++) {
-                    var info = mexc.limitBuyAboveSpreadAccountA(symbol, seedBudget, chatId);
-                    log.info("({}) [{}] SEED result: status={} executedQty={} avgPrice={}",
-                            (step - 1), rid,
-                            info.status(),
-                            info.executedQty().stripTrailingZeros().toPlainString(),
-                            info.avgPrice().stripTrailingZeros().toPlainString());
-                    if (info.executedQty().compareTo(ZERO) > 0) {
-                        seeded = true;
-                        break;
-                    }
-                    sleepQuiet(250L);
-                }
+                boolean seeded = ensureSeed(symbol, buyPrice, planQty, chatId);
                 if (!seeded) {
-                    log.warn("({}) [{}] SEED: не удалось докупить токен (нет исполнения). Прерываю.",
-                            (step - 1), rid);
+                    requestPause(chatId, symbol, "Недостаточно токена на A, SEED не удался.");
                     break;
                 }
-                // обновим баланс
                 balanceA = mexc.getTokenBalanceAccountA(symbol, chatId).stripTrailingZeros();
+                if (balanceA.compareTo(planQty) < 0) {
+                    // На всякий случай режем до того, что есть (после SEED должно хватать, но пусть будет)
+                    planQty = balanceA;
+                }
             }
 
-            // Защита от oversold — не продаём больше, чем реально есть на A
-            BigDecimal qty = planQty.min(balanceA);
-            if (qty.compareTo(planQty) < 0) {
-                log.warn("({}) [{}] Oversold-guard: план={} > балансA={} ⇒ продаю {}",
-                        step, rid,
-                        planQty.stripTrailingZeros().toPlainString(),
-                        balanceA.stripTrailingZeros().toPlainString(),
-                        qty.stripTrailingZeros().toPlainString());
+            // Финальная нормализация
+            BigDecimal qty = mexc.normalizeQtyForSymbol(symbol, planQty);
+            if (qty.signum() <= 0) {
+                requestPause(chatId, symbol, "После нормализации qty=0 — шаг невозможен (stepSize/minQty).");
+                break;
             }
 
-            // План шага — просто, ясно в логах
-            log.info("({}) [{}] План шага: sell={} buy={} delta={} qty={} remaining={}",
-                    step, rid,
-                    sellPrice.toPlainString(),
-                    buyPrice.toPlainString(),
-                    delta.stripTrailingZeros().toPlainString(),
-                    qty.stripTrailingZeros().toPlainString(),
-                    remaining.stripTrailingZeros().toPlainString());
-
-            // 1) A: LIMIT SELL @ low
+            // === 1) A: LIMIT SELL @ low ===
             String sellOrderId = mexc.placeLimitSellAccountA(symbol, sellPrice, qty, chatId);
             if (sellOrderId == null) {
-                log.warn("({}) [{}] A SELL не размещён (minNotional/minQty/валидация). Прерываю.", step, rid);
+                requestPause(chatId, symbol, "SELL A не размещён (minNotional/minQty).");
                 break;
             }
-            log.info("({}) [{}] A ➡ SELL лимитка qty={} @ {} (orderId={})",
-                    step, rid,
-                    qty.stripTrailingZeros().toPlainString(),
-                    sellPrice.toPlainString(),
-                    sellOrderId);
+            if (pausedNow(chatId)) {
+                log.warn("({}) [{}] Пауза после A SELL — отменяю и выхожу", step, rid);
+                cancelBothSafely(symbol, chatId);
+                return;
+            }
+            log.info("({}) [{}] A SELL placed: id={}, qty={}, price={}",
+                    step, rid, sellOrderId, qty.stripTrailingZeros(), sellPrice);
+            setStatus(chatId, "A SELL: id=" + sellOrderId + ", qty=" + qty.stripTrailingZeros() + ", price=" + sellPrice);
 
-            // 2) B: MARKET BUY ~ qty @ low
+            // === 2) B: MARKET BUY этой же qty ===
             mexc.marketBuyFromAccountB(symbol, sellPrice, qty, chatId);
-            log.info("({}) [{}] B ➡ BUY market ~{} @ {}",
-                    step, rid,
-                    qty.stripTrailingZeros().toPlainString(),
-                    sellPrice.toPlainString());
+            setStatus(chatId, "B BUY: qty=" + qty.stripTrailingZeros() + " @~" + sellPrice);
 
-            // 3) A: LIMIT BUY @ high (бюджет ≈ qty * high, maxQty = qty)
-            BigDecimal budgetA = qty.multiply(buyPrice);
-            BigDecimal makerBudget = mexc.reserveForMakerFee(budgetA);
-            String buyOrderId = mexc.placeLimitBuyAccountA(symbol, buyPrice, makerBudget, qty, chatId);
+            if (pausedNow(chatId)) {
+                log.warn("({}) [{}] Пауза после B BUY — отменяю и выхожу", step, rid);
+                cancelBothSafely(symbol, chatId);
+                return;
+            }
+
+            // === 3) A: LIMIT BUY @ high (бюджет ~ qty*high c запасом под makerFee) ===
+            BigDecimal budget = mexc.reserveForMakerFee(qty.multiply(buyPrice));
+            String buyOrderId = mexc.placeLimitBuyAccountA(symbol, buyPrice, budget, qty, chatId);
             if (buyOrderId == null) {
-                log.warn("({}) [{}] A BUY не размещён (minNotional/minQty/валидация). Прерываю.", step, rid);
+                requestPause(chatId, symbol, "BUY A не размещён (budget/minNotional).");
                 break;
             }
-            log.info("({}) [{}] A ➡ BUY лимитка maxQty={} @ {} (orderId={})",
-                    step, rid,
-                    qty.stripTrailingZeros().toPlainString(),
-                    buyPrice.toPlainString(),
-                    buyOrderId);
+            if (pausedNow(chatId)) {
+                log.warn("({}) [{}] Пауза после A BUY — отменяю и выхожу", step, rid);
+                cancelBothSafely(symbol, chatId);
+                return;
+            }
+            log.info("({}) [{}] A BUY placed: id={}, maxQty={}, price={}", step, rid, buyOrderId, qty.stripTrailingZeros(), buyPrice);
+            setStatus(chatId, "A BUY: id=" + buyOrderId + ", maxQty=" + qty.stripTrailingZeros() + ", price=" + buyPrice);
 
-            // 4) B: MARKET SELL ~ qty @ high
+            // === 4) B: MARKET SELL той же qty ===
             mexc.marketSellFromAccountB(symbol, buyPrice, qty, chatId);
-            log.info("({}) [{}] B ➡ SELL market ~{} @ {}",
-                    step, rid,
-                    qty.stripTrailingZeros().toPlainString(),
-                    buyPrice.toPlainString());
+            setStatus(chatId, "B SELL: qty=" + qty.stripTrailingZeros() + " @~" + buyPrice);
 
-            // Аппроксимация «перелитого» за шаг
+            // Итог шага: «перелито» ≈ delta * qty
             BigDecimal stepDrained = delta.multiply(qty);
             drainedUsdt = drainedUsdt.add(stepDrained);
-            BigDecimal finalDrainedUsdt = drainedUsdt;
+
             int finalStep = step;
-            MemoryDb.updateProgress(chatId, st -> {
-                if (st == null) return null;
-                st.setDrainedUsdt(finalDrainedUsdt);
-                st.setStep(finalStep);
-                st.setRangeLow(sellPrice);  // не обязательно, но пусть отражает «текущую» вилку
-                st.setRangeHigh(buyPrice);
-                st.setRunning(true);
-                return st;
+            BigDecimal finalDrained = drainedUsdt;
+            MemoryDb.updateProgress(chatId, s -> {
+                if (s == null) return null;
+                s.setDrainedUsdt(finalDrained);
+                s.setStep(finalStep);
+                s.setUpdatedAt(Instant.now());
+                s.setRunning(true);
+                return s;
             });
+
             log.info("({}) [{}] Шаг завершён: ~перелито {} USDT (итого {} / {})",
                     step, rid,
                     stepDrained.stripTrailingZeros().toPlainString(),
                     drainedUsdt.stripTrailingZeros().toPlainString(),
                     targetUsdt.stripTrailingZeros().toPlainString());
 
+            setStatus(chatId, "✅ Шаг " + step + ": +" + stepDrained.stripTrailingZeros()
+                    + " USDT (итого " + drainedUsdt.stripTrailingZeros() + "/" + targetUsdt.stripTrailingZeros() + ")");
             sleepQuiet(STEP_SLEEP_MS);
         }
 
-        if (drainedUsdt.compareTo(targetUsdt) >= 0) {
-            log.info("✅ [{}] RANGE done. Итог ~{} / {} USDT",
-                    rid,
-                    drainedUsdt.stripTrailingZeros().toPlainString(),
-                    targetUsdt.stripTrailingZeros().toPlainString());
-        } else {
-            log.warn("🟡 [{}] RANGE stopped. Итог ~{} / {} USDT (steps={}/{})",
-                    rid,
-                    drainedUsdt.stripTrailingZeros().toPlainString(),
-                    targetUsdt.stripTrailingZeros().toPlainString(),
-                    step, maxSteps);
+        // Завершение
+        RangeState fin = MemoryDb.getRangeState(chatId);
+        if (fin != null && !fin.isPaused()) {
+            spread.stopMonitor(symbol, chatId);
+            MemoryDb.updateProgress(chatId, s -> {
+                if (s == null) return null;
+                s.setRunning(false);
+                s.setUpdatedAt(Instant.now());
+                return s;
+            });
+            if (fin.getDrainedUsdt().compareTo(fin.getTargetUsdt()) >= 0) {
+                log.info("✅ Перелив завершён: ~{} / {} USDT",
+                        fin.getDrainedUsdt().stripTrailingZeros(), fin.getTargetUsdt().stripTrailingZeros());
+                setStatus(chatId, "🏁 Завершено: ~" + fin.getDrainedUsdt().stripTrailingZeros()
+                        + " / " + fin.getTargetUsdt().stripTrailingZeros() + " USDT");
+            } else {
+                log.warn("🟡 Перелив остановлен: ~{} / {} USDT",
+                        fin.getDrainedUsdt().stripTrailingZeros(), fin.getTargetUsdt().stripTrailingZeros());
+                setStatus(chatId, "🟡 Остановлено: ~" + fin.getDrainedUsdt().stripTrailingZeros()
+                        + " / " + fin.getTargetUsdt().stripTrailingZeros() + " USDT");
+            }
         }
+    }
+
+    /** /stop — жёсткая пауза: снимаем лимитки A/B, сохраняем состояние, монитор останавливаем. */
+    public void stopRange(Long chatId) {
+        RangeState st = MemoryDb.getRangeState(chatId);
+        if (st == null) return;
+        final String symbol = st.getSymbol();
+        try { spread.stopMonitor(symbol, chatId); } catch (Exception ignore) {}
+        try { mexc.cancelAllOpenOrdersAccountA(symbol, chatId); } catch (Exception ignore) {}
+        try { mexc.cancelAllOpenOrdersAccountB(symbol, chatId); } catch (Exception ignore) {}
+        MemoryDb.updateProgress(chatId, s -> {
+            if (s == null) return null;
+            s.setPaused(true);
+            s.setRunning(false);
+            s.setUpdatedAt(Instant.now());
+            return s;
+        });
+        setStatus(chatId, "⏸️ Пауза по /stop. Лимитки сняты, состояние сохранено.");
+        log.warn("⏸️ [chat={}] STOP: лимитки сняты, монитор остановлен.", chatId);
+    }
+
+    /** /continue <LOW> <HIGH> — продолжить с новой вилкой на остаток цели. */
+    public void continueRange(Long chatId, BigDecimal newLow, BigDecimal newHigh) {
+        RangeState st = MemoryDb.getRangeState(chatId);
+        if (st == null) {
+            setStatus(chatId, "⚠️ /continue: нет активного состояния. Сначала /drain в диапазоне.");
+            return;
+        }
+        if (newLow == null || newHigh == null || newLow.compareTo(newHigh) >= 0) {
+            setStatus(chatId, "⚠️ /continue: неверные границы диапазона.");
+            return;
+        }
+        final String symbol = st.getSymbol();
+        final BigDecimal target = nz(st.getTargetUsdt());
+        final BigDecimal drained = nz(st.getDrainedUsdt());
+        BigDecimal remaining = target.subtract(drained);
+        if (remaining.signum() <= 0) {
+            setStatus(chatId, "✅ Нечего продолжать: цель выполнена (" + drained.stripTrailingZeros() + "/" + target.stripTrailingZeros() + ").");
+            return;
+        }
+        try { spread.stopMonitor(symbol, chatId); } catch (Exception ignore) {}
+        try { mexc.cancelAllOpenOrdersAccountA(symbol, chatId); } catch (Exception ignore) {}
+        try { mexc.cancelAllOpenOrdersAccountB(symbol, chatId); } catch (Exception ignore) {}
+
+        setStatus(chatId, "▶️ CONTINUE " + symbol + " [" + newLow + " .. " + newHigh + "], остаток ~" + remaining.stripTrailingZeros() + " USDT");
+        log.info("▶️ [chat={}] CONTINUE {}: новая вилка [{} .. {}], остаток цели ~{} USDT",
+                chatId, symbol, newLow.stripTrailingZeros(), newHigh.stripTrailingZeros(), remaining.stripTrailingZeros());
+
+        startDrainInRange(symbol, newLow, newHigh, remaining, chatId, 50);
+    }
+
+    /** /status — компактный статус. */
+    public String statusText(Long chatId) {
+        RangeState s = MemoryDb.getRangeState(chatId);
+        if (s == null) return "Статус: нет активного состояния. Используй /drain ...";
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("📊 Статус RANGE\n");
+        sb.append("Символ: ").append(s.getSymbol()).append('\n');
+        sb.append("Вилка: [").append(s.getRangeLow()).append(" .. ").append(s.getRangeHigh()).append("]\n");
+        sb.append("Прогресс: ").append(nz(s.getDrainedUsdt()).stripTrailingZeros()).append(" / ")
+                .append(nz(s.getTargetUsdt()).stripTrailingZeros()).append(" USDT\n");
+        sb.append("Шаг: ").append(s.getStep()).append('\n');
+        sb.append("Состояние: ").append(s.isPaused() ? "paused" : (s.isRunning() ? "running" : "idle")).append('\n');
+        if (s.getUpdatedAt() != null) sb.append("Обновлено: ").append(s.getUpdatedAt()).append('\n');
+        try {
+            var f = RangeState.class.getDeclaredField("statusText");
+            f.setAccessible(true);
+            Object val = f.get(s);
+            if (val != null) sb.append('\n').append(val);
+        } catch (Exception ignore) {}
+        return sb.toString();
+    }
+
+    // =========================================================================================
+    // Внутренние утилиты
+    // =========================================================================================
+
+    private static String runId() {
+        byte[] b = new byte[4];
+        new SecureRandom().nextBytes(b);
+        return HexFormat.of().formatHex(b);
+    }
+
+    private static BigDecimal nz(BigDecimal v) { return v != null ? v : ZERO; }
+    private static int nzInt(Integer v) { return v != null ? v : 0; }
+
+    private static BigDecimal divSafe(BigDecimal a, BigDecimal b) {
+        if (a == null || b == null || b.signum() == 0) return ZERO;
+        return a.divide(b, 18, RoundingMode.HALF_UP);
+    }
+    private static BigDecimal floorPositive(BigDecimal v) {
+        if (v == null || v.signum() <= 0) return ZERO;
+        return v.setScale(0, RoundingMode.FLOOR);
+    }
+    private static BigDecimal max(BigDecimal a, BigDecimal b) { return a.compareTo(b) >= 0 ? a : b; }
+
+    private boolean pausedNow(Long chatId) {
+        RangeState s = MemoryDb.getRangeState(chatId);
+        return s != null && s.isPaused();
+    }
+
+    /** Помечаем paused + останавливаем монитор. Отмену ордеров делает основной поток/stopRange. */
+    private void requestPause(Long chatId, String symbol, String message) {
+        log.warn("⏸️ [chat={}] AUTO-PAUSE: {}", chatId, message);
+        setStatus(chatId, "⏸️ Пауза: " + message);
+        spread.stopMonitor(symbol, chatId);
         MemoryDb.updateProgress(chatId, st -> {
             if (st == null) return null;
+            st.setPaused(true);
             st.setRunning(false);
+            st.setUpdatedAt(Instant.now());
             return st;
         });
     }
-    /**
-     * Слепая пауза: просто пометить флаг paused=true.
-     * Внутренний цикл остановится на следующей проверке.
-     */
-    public void stopRange(Long chatId) {
-        com.suhoi.mexcdrainer.util.MemoryDb.markPaused(chatId);
-        log.warn("⏸️ [chat={}] Диапазонный перелив переведён в паузу по /stop", chatId);
-    }
-    /**
-     * Слепое продолжение: берём сохранённое состояние, считаем «остаток» цели и
-     * просто запускаем ещё один цикл с НОВЫМ диапазоном, на той же монете.
-     * НИКАКИХ сверок. Если были висящие лимитки — живём с последствиями.
-     */
-    public void continueRange(Long chatId, BigDecimal newLow, BigDecimal newHigh) {
-        var st = com.suhoi.mexcdrainer.util.MemoryDb.getRangeState(chatId);
-        if (st == null || st.getSymbol() == null) {
-            throw new IllegalStateException("Нет активной диапазонной сессии для этого чата");
-        }
-        BigDecimal drained = st.getDrainedUsdt() == null ? BigDecimal.ZERO : st.getDrainedUsdt();
-        BigDecimal target = st.getTargetUsdt() == null ? BigDecimal.ZERO : st.getTargetUsdt();
 
-        BigDecimal remaining = target.subtract(drained);
-        if (remaining.signum() <= 0) {
-            log.info("▶️ [chat={}] Нечего продолжать: уже достигнута цель {} USDT (drained={})",
-                    chatId, target.stripTrailingZeros(), drained.stripTrailingZeros());
-            return;
-        }
-
-        // Сбрасываем флаг паузы и обновляем вилку в снапшоте
-        com.suhoi.mexcdrainer.util.MemoryDb.updateProgress(chatId, s -> {
-            if (s == null) return null;
-            s.setPaused(false);
-            s.setRunning(true);
-            s.setRangeLow(newLow);
-            s.setRangeHigh(newHigh);
-            return s;
-        });
-
-        log.info("▶️ [chat={}] CONTINUE {} с новой вилкой [{} .. {}], остаток цели ~{} USDT",
-                chatId, st.getSymbol(), newLow.toPlainString(), newHigh.toPlainString(),
-                remaining.stripTrailingZeros().toPlainString());
-
-        // Запускаем ещё один цикл на остаток
-        startDrainInRange(chatId, st.getSymbol(), newLow, newHigh, remaining);
+    private void cancelBothSafely(String symbol, Long chatId) {
+        try { mexc.cancelAllOpenOrdersAccountA(symbol, chatId); } catch (Exception ignore) {}
+        try { mexc.cancelAllOpenOrdersAccountB(symbol, chatId); } catch (Exception ignore) {}
     }
 
-    // =========================================================================================
-    // ВСПОМОГАТЕЛЬНОЕ
-    // =========================================================================================
+    /** SEED: гарантируем, что на A будет минимум qtyNeed токена. */
+    private boolean ensureSeed(String symbol, BigDecimal buyPrice, BigDecimal qtyNeed, Long chatId) {
+        BigDecimal balanceA = mexc.getTokenBalanceAccountA(symbol, chatId).stripTrailingZeros();
+        if (balanceA.compareTo(qtyNeed) >= 0) return true;
 
-    /** Для планирования qty — оставляем целую часть (часто stepSize=1). */
-    private static BigDecimal safeFloor(BigDecimal v) {
-        if (v == null) return ZERO;
-        if (v.signum() <= 0) return ZERO;
-        return v.setScale(0, RoundingMode.DOWN).stripTrailingZeros();
+        BigDecimal deficit = qtyNeed.subtract(balanceA);
+        if (deficit.signum() <= 0) return true;
+
+        BigDecimal budget = buyPrice.multiply(deficit).multiply(SEED_BUDGET_K);
+        try {
+            MexcTradeService.OrderInfo m = mexc.marketBuyAccountAFull(symbol, budget, chatId);
+            if (m != null && m.executedQty().signum() > 0) return true;
+        } catch (Exception ignore) {}
+
+        try {
+            MexcTradeService.OrderInfo l = mexc.limitBuyAboveSpreadAccountA(symbol, budget, chatId);
+            if (l != null && l.executedQty().signum() > 0) return true;
+        } catch (Exception ignore) {}
+
+        return mexc.getTokenBalanceAccountA(symbol, chatId).compareTo(qtyNeed) >= 0;
+    }
+
+    /** Пишем короткий статус в RangeState.statusText, если поле есть. */
+    private static void setStatus(Long chatId, String text) {
+        try {
+            MemoryDb.updateProgress(chatId, st -> {
+                if (st == null) return null;
+                try {
+                    var f = RangeState.class.getDeclaredField("statusText");
+                    f.setAccessible(true);
+                    f.set(st, text);
+                } catch (NoSuchFieldException ignore) {
+                    // поле может отсутствовать — не критично
+                } catch (Exception e) {
+                    // игнорируем прочие сбои статуса
+                }
+                st.setUpdatedAt(Instant.now());
+                return st;
+            });
+        } catch (Exception ignore) { }
     }
 
     private static void sleepQuiet(long ms) {
-        try { Thread.sleep(ms); } catch (InterruptedException ignored) { }
+        try { Thread.sleep(ms); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
 }

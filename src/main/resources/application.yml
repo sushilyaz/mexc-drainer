@@ -13,3 +13,8 @@ app:
     maxCycles: 100
     takerFeePct: 0.0005
     safetySpendPct: 0.998
+logging:
+  level:
+    root: INFO
+    com.suhoi.mexcdrainer.service.MexcTradeService: DEBUG
+    com.suhoi.mexcdrainer.service.SpreadMonitorService: DEBUG

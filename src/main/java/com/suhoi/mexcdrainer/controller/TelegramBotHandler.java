@@ -7,21 +7,18 @@ import com.suhoi.mexcdrainer.service.RangeDrainService;
 import com.suhoi.mexcdrainer.service.TelegramService;
 import com.suhoi.mexcdrainer.util.MemoryDb;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.objects.Update;
 
 import java.math.BigDecimal;
 
-import lombok.extern.slf4j.Slf4j;
-
-
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class TelegramBotHandler extends TelegramLongPollingBot {
 
-    // ВАЖНО: final => Lombok заинжектит через конструктор
     private final RangeDrainService rangeDrainService;
     private final DrainService drainService;
     private final AppProperties appProperties;
@@ -48,20 +45,22 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
             if (text.startsWith("/start")) {
                 tg.reply(chatId, """
                         Привет! Я бот для перелива через спред на MEXC.
-                        
-                        Команды:
+
+                        Ключи:
                         /setA <apiKey> <secretKey> — задать ключи Аккаунта A (С КОТОРОГО переливаем)
                         /setB <apiKey> <secretKey> — задать ключи Аккаунта B (НА КОТОРЫЙ переливаем)
-                        
+
                         Режимы перелива:
-                        1) Простой:   /drain <SYMBOL> <USDT>
+                        1) Простой: /drain <SYMBOL> <USDT>
                            пример: /drain ANTUSDT 5
-                        
+
                         2) В диапазоне: /drain <SYMBOL> <LOW> <HIGH> <USDT>
                            пример: /drain ANTUSDT 0,000010 0,000020 5
-                           Цены можно писать с запятой или точкой.
-                        
-                        ⚠️ Ключи хранятся только в памяти процесса и пропадут при перезапуске.
+
+                        Управление:
+                        /stop — жёсткая пауза: снимаем лимитки, состояние сохраняем
+                        /continue <LOW> <HIGH> — продолжаем с нового диапазона
+                        /status — показать статус (балансы A/B, прогресс, открытые ордера)
                         """);
                 return;
             }
@@ -88,9 +87,13 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                 return;
             }
 
+            if (text.startsWith("/status")) {
+                tg.reply(chatId, rangeDrainService.statusText(chatId));
+                return;
+            }
+
             if (text.startsWith("/drain")) {
                 String[] p = text.split("\\s+");
-                // Проверим наличие ключей заранее
                 var a = MemoryDb.getAccountA(chatId);
                 var b = MemoryDb.getAccountB(chatId);
                 if (a == null || b == null) {
@@ -98,7 +101,6 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                     return;
                 }
 
-                // --- Режим 1: старый (/drain SYMBOL USDT)
                 if (p.length == 3) {
                     final String symbol = p[1].toUpperCase();
                     final BigDecimal usdt = parseDecimalSafe(p[2]);
@@ -107,12 +109,10 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                         return;
                     }
                     tg.reply(chatId, "▶️ Запускаю перелив: %s на %s USDT".formatted(symbol, usdt.stripTrailingZeros()));
-                    // Синхронно, как у тебя и было (можно вынести в отдельный executor, если захочешь)
                     drainService.startDrain(symbol, usdt, chatId, 20);
                     return;
                 }
 
-                // --- Режим 2: новый диапазон (/drain SYMBOL LOW HIGH USDT)
                 if (p.length == 5) {
                     final String symbol = p[1].toUpperCase();
                     final BigDecimal low = parseDecimalSafe(p[2]);
@@ -142,7 +142,6 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                                     high.stripTrailingZeros().toPlainString(),
                                     usdt.stripTrailingZeros().toPlainString()));
 
-                    // В отдельном потоке, чтобы не блокировать Telegram LongPolling поток
                     new Thread(() -> {
                         try {
                             rangeDrainService.startDrainInRange(chatId, symbol, low, high, usdt);
@@ -156,7 +155,6 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                     return;
                 }
 
-                // Если формат не распознан
                 tg.reply(chatId, """
                         Неверный формат. Используйте:
                         /drain <SYMBOL> <USDT>  или
@@ -171,7 +169,7 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
             if (text.equals("/stop")) {
                 try {
                     rangeDrainService.stopRange(chatId);
-                    tg.reply(chatId, "⏸️ Пауза включена. Текущий цикл остановится без принудительных продаж/отмен.");
+                    tg.reply(chatId, "⏸️ Пауза включена. Лимитки сняты, состояние сохранено. Ничего по рынку не скидывал.");
                 } catch (Exception e) {
                     tg.reply(chatId, "❌ Ошибка при остановке: " + e.getMessage());
                 }
@@ -191,12 +189,10 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                     return;
                 }
 
-                // Запустить "продолжение" в отдельном потоке, чтобы не блокировать телеграм-пуллинг
                 new Thread(() -> {
                     try {
                         rangeDrainService.continueRange(chatId, low, high);
-                        tg.reply(chatId, "▶️ Продолжаю в вилке [%s .. %s] (остаток цели из состояния)"
-                                .formatted(low.stripTrailingZeros(), high.stripTrailingZeros()));
+                        tg.reply(chatId, "▶️ Продолжаю в вилке [%s .. %s]".formatted(low.stripTrailingZeros(), high.stripTrailingZeros()));
                     } catch (Exception e) {
                         tg.reply(chatId, "❌ Ошибка /continue: " + e.getMessage());
                     }
@@ -204,7 +200,6 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
 
                 return;
             }
-
 
             tg.reply(chatId, "Неизвестная команда. Наберите /start");
 
@@ -214,12 +209,6 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
         }
     }
 
-    // --- Utils ---
-
-    /**
-     * Безопасный парсер десятичных чисел: поддерживает запятую и точку.
-     * Возвращает null при ошибке.
-     */
     private static BigDecimal parseDecimalSafe(String s) {
         if (s == null) return null;
         try {
@@ -229,5 +218,3 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
         }
     }
 }
-
-

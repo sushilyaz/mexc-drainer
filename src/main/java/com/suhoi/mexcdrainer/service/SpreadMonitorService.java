@@ -20,12 +20,6 @@ import java.util.function.Consumer;
 
 import static java.math.BigDecimal.ZERO;
 
-/**
- * Монитор спреда для заданного диапазона.
- * Поддерживает два режима:
- *  - RAW: обычный топ стакана (bookTicker)
- *  - EX-SELF: топ стакана за вычетом собственных лимиток Аккаунта A (через depth + openOrders)
- */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -33,14 +27,14 @@ public class SpreadMonitorService {
 
     private static final String API_BASE = "https://api.mexc.com";
     private static final String TICKER_BOOK = "/api/v3/ticker/bookTicker";
+    // ставь true, чтобы видеть снимок спреда на каждом тике
+    private static final boolean LOG_TICK_SPREAD = true;
 
-    /** Сколько уровней глубины берём для EX-SELF оценки (REST). */
     private static final int DEPTH_LIMIT = 20;
 
     private final RestTemplate rest = new RestTemplate();
     private final ObjectMapper om = new ObjectMapper();
 
-    /** Нужен для EX-SELF режима (depth + openOrders + расчёт top без собственных заявок). */
     private final MexcTradeService mexc;
 
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(
@@ -58,18 +52,18 @@ public class SpreadMonitorService {
         BigDecimal bid;
         BigDecimal ask;
         BigDecimal spread; // ask - bid
-        boolean    exSelf; // true если bid/ask посчитаны без собственных лимиток
+        boolean    exSelf;
     }
 
     @Value
     public static class MonitorConfig {
         String symbol;
-        BigDecimal rangeLow;    // включительно
-        BigDecimal rangeHigh;   // включительно
-        Duration  period;       // период опроса
-        int       tickSafety;   // "тик-запас" (0..3)
-        boolean   excludeSelf;  // считать спред «без своих» лимиток?
-        Long      chatId;       // чей A-аккаунт исключать (для openOrders)
+        BigDecimal rangeLow;
+        BigDecimal rangeHigh;
+        Duration  period;
+        int       tickSafety;
+        boolean   excludeSelf;
+        Long      chatId;       // для excludeSelf и для ключа монитора
     }
 
     public static class MonitorHandle implements AutoCloseable {
@@ -87,63 +81,77 @@ public class SpreadMonitorService {
         public void close() {
             if (stopped) return;
             stopped = true;
-            if (fut != null) fut.cancel(true);
+            if (fut != null) fut.cancel(false);
             if (onStop != null) onStop.run();
         }
     }
 
-    /**
-     * Запустить мониторинг. При выходе диапазона из спреда — вызовет onStopCallback и самостопнется.
-     */
     public MonitorHandle startMonitor(MonitorConfig cfg, Consumer<SpreadSnapshot> onStopCallback) {
-        String key = cfg.getSymbol();
-        stopMonitor(key); // если уже был
+        final String key = cfg.getSymbol() + "#" + cfg.getChatId();
+        stopMonitor(cfg.getSymbol(), cfg.getChatId());
 
-        long periodMs = Math.max(50, cfg.getPeriod().toMillis());
+        final java.util.concurrent.atomic.AtomicBoolean wasInside = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        long periodMs = Math.max(80, cfg.getPeriod().toMillis());
         ScheduledFuture<?> fut = scheduler.scheduleAtFixedRate(() -> {
             try {
                 SpreadSnapshot s = cfg.isExcludeSelf()
                         ? fetchTopExSelf(cfg.getSymbol(), cfg.getChatId())
                         : fetchTopRaw(cfg.getSymbol());
+                if (LOG_TICK_SPREAD && log.isDebugEnabled()) {
+                    // Удобный однострочник с текущим снимком
+                    log.debug("SPREAD[{}|{}|{}] bid={} ask={} spread={} | range=[{}..{}]",
+                            cfg.getSymbol(), cfg.getChatId(), (cfg.isExcludeSelf() ? "EX-SELF" : "RAW"),
+                            s.getBid().stripTrailingZeros().toPlainString(),
+                            s.getAsk().stripTrailingZeros().toPlainString(),
+                            s.getSpread().stripTrailingZeros().toPlainString(),
+                            cfg.getRangeLow().stripTrailingZeros().toPlainString(),
+                            cfg.getRangeHigh().stripTrailingZeros().toPlainString());
+                }
+                // DIAG: параллельно снимем RAW для сравнения
+                if (LOG_TICK_SPREAD && log.isDebugEnabled()) {
+                    try {
+                        SpreadSnapshot raw = fetchTopRaw(cfg.getSymbol());
+                        log.debug("SPREAD-RAW[{}|{}] bid={} ask={} spread={}",
+                                cfg.getSymbol(), cfg.getChatId(),
+                                raw.getBid().stripTrailingZeros().toPlainString(),
+                                raw.getAsk().stripTrailingZeros().toPlainString(),
+                                raw.getSpread().stripTrailingZeros().toPlainString());
+                    } catch (Exception ignore) { }
+                }
 
-                if (violatesRange(cfg, s)) {
-                    log.warn("🛑 [{}] Диапазон {}–{} ВЫШЕЛ из {}спреда: bid={} ask={} spread={}",
-                            cfg.getSymbol(),
-                            cfg.getRangeLow().toPlainString(), cfg.getRangeHigh().toPlainString(),
-                            s.isExSelf() ? "EX-SELF " : "",
-                            s.getBid().toPlainString(), s.getAsk().toPlainString(), s.getSpread().toPlainString());
+                boolean violate = violatesRange(cfg, s);
+                if (!violate) {
+                    wasInside.set(true); // запомнили, что хотя бы раз были внутри
+                } else if (wasInside.get()) {
+                    // только переход inside -> outside считается триггером
                     Optional.ofNullable(onStopCallback).ifPresent(cb -> {
                         try { cb.accept(s); } catch (Exception ignore) {}
                     });
-                    stopMonitor(key);
+                    stopMonitor(cfg.getSymbol(), cfg.getChatId());
                 }
             } catch (Exception e) {
-                log.error("SpreadMonitor error [{}]: {}", cfg.getSymbol(), e.getMessage());
+                log.error("SpreadMonitor error [{}|{}]: {}", cfg.getSymbol(), cfg.getChatId(), e.getMessage());
             }
         }, 0, periodMs, TimeUnit.MILLISECONDS);
 
         MonitorHandle handle = new MonitorHandle(key, fut, () -> active.remove(key));
         active.put(key, handle);
-
-        log.info("▶️ [{}] Запустил мониторинг спреда: диапазон={}–{}, период={}ms, режим={}",
-                cfg.getSymbol(),
-                cfg.getRangeLow().toPlainString(), cfg.getRangeHigh().toPlainString(),
-                periodMs,
-                cfg.isExcludeSelf() ? "EX-SELF" : "RAW");
         return handle;
     }
 
-    public void stopMonitor(String symbol) {
-        MonitorHandle h = active.remove(symbol);
+
+    public void stopMonitor(String symbol, Long chatId) {
+        String key = symbol + "#" + chatId;
+        MonitorHandle h = active.remove(key);
         if (h != null) {
             try { h.close(); } catch (Exception ignore) {}
-            log.info("⏹ [{}] Остановил мониторинг спреда", symbol);
+            log.info("⏹ [{}|{}] Остановил мониторинг спреда", symbol, chatId);
         }
     }
 
     // ===== Источники котировок =====
 
-    /** Обычный топ стакана (bookTicker). */
     private SpreadSnapshot fetchTopRaw(String symbol) {
         ResponseEntity<String> r = rest.getForEntity(API_BASE + TICKER_BOOK + "?symbol=" + symbol, String.class);
         JsonNode j;
@@ -155,16 +163,11 @@ public class SpreadMonitorService {
         if (bid.signum() <= 0 && ask.signum() > 0) bid = ask;
         if (ask.signum() <= 0 && bid.signum() > 0) ask = bid;
         if (bid.signum() <= 0 && ask.signum() <= 0) {
-            // мёртвый стакан — считаем spread=0, чтобы сразу остановиться
             return new SpreadSnapshot(ZERO, ZERO, ZERO, false);
         }
         return new SpreadSnapshot(bid, ask, ask.subtract(bid), false);
     }
 
-    /**
-     * Топ стакана «без своих лимиток» аккаунта A:
-     * depth(limit=DEPTH_LIMIT) - openOrders(A) → вычитаем свои остатки на ценах → ищем первый уровень с netQty>0.
-     */
     private SpreadSnapshot fetchTopExSelf(String symbol, Long chatId) {
         try {
             MexcTradeService.TopOfBook tob = mexc.topExcludingSelf(symbol, chatId, DEPTH_LIMIT);
@@ -177,31 +180,29 @@ public class SpreadMonitorService {
             }
             return new SpreadSnapshot(bid, ask, ask.subtract(bid), true);
         } catch (Exception e) {
-            log.warn("fetchTopExSelf[{}] error: {}", symbol, e.getMessage());
-            // фолбэк на RAW, чтобы не глохнуть
+            log.warn("fetchTopExSelf[{}|{}] error: {}", symbol, chatId, e.getMessage());
             SpreadSnapshot raw = fetchTopRaw(symbol);
             return new SpreadSnapshot(raw.getBid(), raw.getAsk(), raw.getSpread(), true);
         }
     }
 
-    // ===== Правило остановки =====
-
-    /** TRUE → надо остановиться (диапазон больше не полностью внутри спреда). */
+    // TRUE -> надо остановиться (вилка НЕ целиком внутри [bid; ask] с запасом pad)
     private boolean violatesRange(MonitorConfig cfg, SpreadSnapshot s) {
-        if (s.getSpread().signum() <= 0) return true;
+        // пустой/невалидный стакан — стопаемся
+        if (s.getBid().signum() <= 0 || s.getAsk().signum() <= 0) return true;
+        if (s.getAsk().compareTo(s.getBid()) <= 0) return true;
 
-        // Условие 1: спред шире диапазона
-        BigDecimal bandWidth = cfg.getRangeHigh().subtract(cfg.getRangeLow());
-        if (s.getSpread().compareTo(bandWidth) < 0) return true;
+        // небольшой «зазор» от краёв спреда
+        BigDecimal pad = s.getSpread()
+                .divide(new java.math.BigDecimal("500"), 12, java.math.RoundingMode.HALF_UP)
+                .multiply(java.math.BigDecimal.valueOf(Math.max(0, Math.min(3, cfg.getTickSafety()))));
 
-        // Условие 2: диапазон полностью внутри [bid; ask], с "тик-запасом" по краям
-        // tickSafety реализуем как долю спреда, чтобы не лезть в тик-логику здесь
-        BigDecimal pad = s.getSpread().divide(BigDecimal.valueOf(500L), 12, java.math.RoundingMode.HALF_UP)
-                .multiply(BigDecimal.valueOf(Math.max(0, Math.min(3, cfg.getTickSafety())))); // ~0.2% спреда на "тик"
-
-        boolean inside = s.getBid().subtract(pad).compareTo(cfg.getRangeLow()) <= 0
-                && s.getAsk().add(pad).compareTo(cfg.getRangeHigh()) >= 0;
+        // Правильная геометрия: [LOW..HIGH] внутри [bid+pad .. ask-pad]
+        boolean inside =
+                cfg.getRangeLow().compareTo(s.getBid().add(pad)) >= 0 &&
+                        cfg.getRangeHigh().compareTo(s.getAsk().subtract(pad)) <= 0;
 
         return !inside;
     }
+
 }
