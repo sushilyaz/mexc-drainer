@@ -29,7 +29,7 @@ public class DrainService {
         try {
             log.info("🚀 Запуск перелива: символ={}, сумма={} USDT", symbol, usdtAmount);
 
-            // 1) MARKET BUY A (берём фактическое executedQty)
+            // ШАГ 1 MARKET BUY A (берём фактическое executedQty)
             MexcTradeService.OrderInfo buyA = mexcTradeService.marketBuyAccountAFull(symbol, usdtAmount, chatId);
             if (buyA == null || buyA.executedQty().signum() <= 0) {
                 log.error("A ➡ Market BUY не дал executedQty. Статус={}", buyA == null ? "null" : buyA.status());
@@ -69,7 +69,7 @@ public class DrainService {
         try {
             long tCycle = System.currentTimeMillis();
 
-            // 1) A продаёт лимиткой возле нижней границы
+            //  ШАГ 2 A продаёт лимиткой возле нижней границы
             BigDecimal sellPrice = mexcTradeService.getNearLowerSpreadPrice(symbol);
             log.info("🎯 A SELL лимитка: price={} (нижняя граница)", sellPrice.stripTrailingZeros().toPlainString());
 
@@ -77,7 +77,7 @@ public class DrainService {
             log.info("A ➡ SELL лимитка {} токенов @ {} (orderId={})",
                     qtyTokens.stripTrailingZeros(), sellPrice.stripTrailingZeros(), sellOrderId);
 
-            // 2) B покупает по рынку (на сумму ~ price*qty c учётом комиссии), чтобы заполнить A
+            //  ШАГ 3  B покупает по рынку (на сумму ~ price*qty c учётом комиссии), чтобы заполнить A
             log.info("🧮 План для B BUY: цена={} * qty={} ≈ {} USDT",
                     sellPrice.stripTrailingZeros(), qtyTokens.stripTrailingZeros(),
                     sellPrice.multiply(qtyTokens).stripTrailingZeros());
@@ -85,7 +85,7 @@ public class DrainService {
             log.info("B ➡ BUY market ~{} токенов @ {} (на сумму ~с учётом комиссии)",
                     qtyTokens.stripTrailingZeros(), sellPrice.stripTrailingZeros());
 
-            // 3) Дожидаемся FILLED по A-SELL, чтобы взять реальный usdtEarned
+            //  ШАГ 4  Дожидаемся FILLED по A-SELL, чтобы взять реальный usdtEarned
             MexcTradeService.OrderInfo sellAInfo = null;
             if (sellOrderId != null) {
                 var credsA = MemoryDb.getAccountA(chatId);
@@ -101,7 +101,7 @@ public class DrainService {
                     sellAInfo.executedQty().stripTrailingZeros(),
                     sellAInfo.avgPrice().stripTrailingZeros());
 
-            // 4) A готовит лимитный BUY возле верхней границы,
+            //  ШАГ 5  A готовит лимитный BUY возле верхней границы,
             //    НО сначала планируем, сколько реально сможет продать B (учёт stepSize/minNotional/остатка/комиссии)
             BigDecimal buyPrice = mexcTradeService.getNearUpperSpreadPrice(symbol);
             log.info("🎯 A BUY лимитка: планируем price={} (верхняя граница)", buyPrice.stripTrailingZeros().toPlainString());
@@ -124,11 +124,11 @@ public class DrainService {
                     spendA.stripTrailingZeros(), buyPrice.stripTrailingZeros(),
                     plannedSellQtyB.stripTrailingZeros(), buyOrderId);
 
-            // 5) B продаёт по рынку ровно то количество, которое мы заложили в BUY A
+            //  ШАГ 6  B продаёт по рынку ровно то количество, которое мы заложили в BUY A
             mexcTradeService.marketSellFromAccountB(symbol, buyPrice, plannedSellQtyB, chatId);
             log.info("B ➡ SELL market {} токенов @ {}", plannedSellQtyB.stripTrailingZeros(), buyPrice.stripTrailingZeros());
 
-            // 6) Дожидаемся FILLED по A-BUY, возвращаем фактическое количество на следующий цикл
+            //  ШАГ 7  Дожидаемся FILLED по A-BUY, возвращаем фактическое количество на следующий цикл
             MexcTradeService.OrderInfo buyAInfo = null;
             if (buyOrderId != null) {
                 var credsA = MemoryDb.getAccountA(chatId);

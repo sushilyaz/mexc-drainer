@@ -3,7 +3,6 @@ package com.suhoi.mexcdrainer.controller;
 import com.suhoi.mexcdrainer.config.AppProperties;
 import com.suhoi.mexcdrainer.model.Creds;
 import com.suhoi.mexcdrainer.service.DrainService;
-import com.suhoi.mexcdrainer.service.RangeDrainService;
 import com.suhoi.mexcdrainer.service.TelegramService;
 import com.suhoi.mexcdrainer.util.MemoryDb;
 import lombok.RequiredArgsConstructor;
@@ -21,8 +20,6 @@ import lombok.extern.slf4j.Slf4j;
 @RequiredArgsConstructor
 public class TelegramBotHandler extends TelegramLongPollingBot {
 
-    // ВАЖНО: final => Lombok заинжектит через конструктор
-    private final RangeDrainService rangeDrainService;
     private final DrainService drainService;
     private final AppProperties appProperties;
     private final TelegramService tg;
@@ -109,50 +106,6 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                     tg.reply(chatId, "▶️ Запускаю перелив: %s на %s USDT".formatted(symbol, usdt.stripTrailingZeros()));
                     // Синхронно, как у тебя и было (можно вынести в отдельный executor, если захочешь)
                     drainService.startDrain(symbol, usdt, chatId, 20);
-                    return;
-                }
-
-                // --- Режим 2: новый диапазон (/drain SYMBOL LOW HIGH USDT)
-                if (p.length == 5) {
-                    final String symbol = p[1].toUpperCase();
-                    final BigDecimal low  = parseDecimalSafe(p[2]);
-                    final BigDecimal high = parseDecimalSafe(p[3]);
-                    final BigDecimal usdt = parseDecimalSafe(p[4]);
-
-                    if (low == null || high == null || usdt == null) {
-                        tg.reply(chatId, """
-                                Некорректные числа.
-                                Формат: /drain <SYMBOL> <LOW> <HIGH> <USDT>
-                                Пример: /drain ANTUSDT 0,000010 0,000020 5
-                                """);
-                        return;
-                    }
-                    if (low.signum() <= 0 || high.signum() <= 0 || low.compareTo(high) >= 0) {
-                        tg.reply(chatId, "Неверный диапазон цен: LOW должен быть > 0 и меньше HIGH.");
-                        return;
-                    }
-                    if (usdt.signum() <= 0) {
-                        tg.reply(chatId, "Сумма USDT должна быть > 0.");
-                        return;
-                    }
-
-                    tg.reply(chatId, "▶️ Диапазонный перелив: %s в [%s .. %s], цель %s USDT"
-                            .formatted(symbol,
-                                    low.stripTrailingZeros().toPlainString(),
-                                    high.stripTrailingZeros().toPlainString(),
-                                    usdt.stripTrailingZeros().toPlainString()));
-
-                    // В отдельном потоке, чтобы не блокировать Telegram LongPolling поток
-                    new Thread(() -> {
-                        try {
-                            rangeDrainService.startDrainInRange(chatId, symbol, low, high, usdt);
-                            tg.reply(chatId, "✅ Перелив по %s завершён.".formatted(symbol));
-                        } catch (Exception e) {
-                            log.error("Ошибка диапазонного перелива", e);
-                            tg.reply(chatId, "❌ Ошибка перелива: " + e.getMessage());
-                        }
-                    }, "drain-range-" + symbol + "-" + chatId).start();
-
                     return;
                 }
 
