@@ -1,5 +1,7 @@
 package com.suhoi.mexcdrainer.service;
 
+import com.suhoi.mexcdrainer.model.RangeState;
+import com.suhoi.mexcdrainer.util.MemoryDb;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -94,6 +96,18 @@ public class RangeDrainService {
         if (symbol == null || rangeLow == null || rangeHigh == null || targetUsdt == null) {
             throw new IllegalArgumentException("Пустые параметры запуска диапазонного перелива");
         }
+        MemoryDb.saveNewRangeState(chatId,
+               RangeState.builder()
+                        .symbol(symbol)
+                        .rangeLow(rangeLow)
+                        .rangeHigh(rangeHigh)
+                        .targetUsdt(targetUsdt)
+                        .drainedUsdt(BigDecimal.ZERO)
+                        .step(0)
+                        .paused(false)
+                        .running(true)
+                        .build()
+        );
         symbol = symbol.trim().toUpperCase();
 
         rangeLow  = rangeLow.stripTrailingZeros();
@@ -127,6 +141,15 @@ public class RangeDrainService {
 
         // ---------- Основной цикл ----------
         while (drainedUsdt.compareTo(targetUsdt) < 0 && step < Math.max(1, maxSteps)) {
+            var state = MemoryDb.getRangeState(chatId);
+            if (state != null && state.isPaused()) {
+                log.warn("⏸️ [{}] RANGE paused по команде /stop. Шаг={} drained={} / target={}",
+                        rid, step,
+                        drainedUsdt.stripTrailingZeros().toPlainString(),
+                        targetUsdt.stripTrailingZeros().toPlainString());
+                // Просто выходим из метода. НИЧЕГО НЕ ОТМЕНЯЕМ.
+                return;
+            }
             step++;
 
             // Сколько хотим «продать на A» на этом шаге, чтобы приблизиться к цели?
@@ -237,7 +260,17 @@ public class RangeDrainService {
             // Аппроксимация «перелитого» за шаг
             BigDecimal stepDrained = delta.multiply(qty);
             drainedUsdt = drainedUsdt.add(stepDrained);
-
+            BigDecimal finalDrainedUsdt = drainedUsdt;
+            int finalStep = step;
+            MemoryDb.updateProgress(chatId, st -> {
+                if (st == null) return null;
+                st.setDrainedUsdt(finalDrainedUsdt);
+                st.setStep(finalStep);
+                st.setRangeLow(sellPrice);  // не обязательно, но пусть отражает «текущую» вилку
+                st.setRangeHigh(buyPrice);
+                st.setRunning(true);
+                return st;
+            });
             log.info("({}) [{}] Шаг завершён: ~перелито {} USDT (итого {} / {})",
                     step, rid,
                     stepDrained.stripTrailingZeros().toPlainString(),
@@ -259,6 +292,56 @@ public class RangeDrainService {
                     targetUsdt.stripTrailingZeros().toPlainString(),
                     step, maxSteps);
         }
+        MemoryDb.updateProgress(chatId, st -> {
+            if (st == null) return null;
+            st.setRunning(false);
+            return st;
+        });
+    }
+    /**
+     * Слепая пауза: просто пометить флаг paused=true.
+     * Внутренний цикл остановится на следующей проверке.
+     */
+    public void stopRange(Long chatId) {
+        com.suhoi.mexcdrainer.util.MemoryDb.markPaused(chatId);
+        log.warn("⏸️ [chat={}] Диапазонный перелив переведён в паузу по /stop", chatId);
+    }
+    /**
+     * Слепое продолжение: берём сохранённое состояние, считаем «остаток» цели и
+     * просто запускаем ещё один цикл с НОВЫМ диапазоном, на той же монете.
+     * НИКАКИХ сверок. Если были висящие лимитки — живём с последствиями.
+     */
+    public void continueRange(Long chatId, BigDecimal newLow, BigDecimal newHigh) {
+        var st = com.suhoi.mexcdrainer.util.MemoryDb.getRangeState(chatId);
+        if (st == null || st.getSymbol() == null) {
+            throw new IllegalStateException("Нет активной диапазонной сессии для этого чата");
+        }
+        BigDecimal drained = st.getDrainedUsdt() == null ? BigDecimal.ZERO : st.getDrainedUsdt();
+        BigDecimal target = st.getTargetUsdt() == null ? BigDecimal.ZERO : st.getTargetUsdt();
+
+        BigDecimal remaining = target.subtract(drained);
+        if (remaining.signum() <= 0) {
+            log.info("▶️ [chat={}] Нечего продолжать: уже достигнута цель {} USDT (drained={})",
+                    chatId, target.stripTrailingZeros(), drained.stripTrailingZeros());
+            return;
+        }
+
+        // Сбрасываем флаг паузы и обновляем вилку в снапшоте
+        com.suhoi.mexcdrainer.util.MemoryDb.updateProgress(chatId, s -> {
+            if (s == null) return null;
+            s.setPaused(false);
+            s.setRunning(true);
+            s.setRangeLow(newLow);
+            s.setRangeHigh(newHigh);
+            return s;
+        });
+
+        log.info("▶️ [chat={}] CONTINUE {} с новой вилкой [{} .. {}], остаток цели ~{} USDT",
+                chatId, st.getSymbol(), newLow.toPlainString(), newHigh.toPlainString(),
+                remaining.stripTrailingZeros().toPlainString());
+
+        // Запускаем ещё один цикл на остаток
+        startDrainInRange(chatId, st.getSymbol(), newLow, newHigh, remaining);
     }
 
     // =========================================================================================

@@ -179,6 +179,63 @@ public class MexcTradeService {
         return BigDecimal.ZERO;
     }
 
+    // --- Открытые ордера аккаунта B по символу (аналогично A)
+    public java.util.List<OpenOrder> getOpenOrdersAccountB(String symbol, Long chatId) {
+        var creds = com.suhoi.mexcdrainer.util.MemoryDb.getAccountB(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
+
+        java.util.Map<String, String> p = new java.util.LinkedHashMap<>();
+        p.put("symbol", symbol);
+
+        com.fasterxml.jackson.databind.JsonNode resp =
+                signedRequest("GET", API_PREFIX + "/openOrders", p, creds.getApiKey(), creds.getSecret());
+
+        java.util.List<OpenOrder> out = new java.util.ArrayList<>();
+        if (resp != null && resp.isArray()) {
+            for (com.fasterxml.jackson.databind.JsonNode n : resp) {
+                String orderId = n.path("orderId").asText(null);
+                String side    = n.path("side").asText(null);
+                java.math.BigDecimal price = bd(n.path("price").asText("0"));
+                java.math.BigDecimal orig  = bd(n.path("origQty").asText("0"));
+                java.math.BigDecimal exec  = bd(n.path("executedQty").asText("0"));
+                out.add(new OpenOrder(orderId, side, price, orig, exec));
+            }
+        }
+        return out;
+    }
+
+    /** Отменить все открытые ордера аккаунта A по символу. Возвращает кол-во "попыток отмены". */
+    public int cancelAllOpenOrdersAccountA(String symbol, Long chatId) {
+        var creds = com.suhoi.mexcdrainer.util.MemoryDb.getAccountA(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
+        var list = getOpenOrdersAccountA(symbol, chatId);
+        int cancelled = 0;
+        for (OpenOrder o : list) {
+            if (o.orderId() != null && o.remaining().signum() > 0) {
+                tryCancelOrder(symbol, o.orderId(), creds.getApiKey(), creds.getSecret());
+                cancelled++;
+            }
+        }
+        log.warn("❌ [{}] A: отменил открытых ордеров: {}", symbol, cancelled);
+        return cancelled;
+    }
+
+    /** Отменить все открытые ордера аккаунта B по символу. Возвращает кол-во "попыток отмены". */
+    public int cancelAllOpenOrdersAccountB(String symbol, Long chatId) {
+        var creds = com.suhoi.mexcdrainer.util.MemoryDb.getAccountB(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
+        var list = getOpenOrdersAccountB(symbol, chatId);
+        int cancelled = 0;
+        for (OpenOrder o : list) {
+            if (o.orderId() != null && o.remaining().signum() > 0) {
+                tryCancelOrder(symbol, o.orderId(), creds.getApiKey(), creds.getSecret());
+                cancelled++;
+            }
+        }
+        log.warn("❌ [{}] B: отменил открытых ордеров: {}", symbol, cancelled);
+        return cancelled;
+    }
+
     // ======= ORDERS =======
 
 // Рынок BUY A с FULL-ответом (+ожидание); если не FILLED — фолбэк лимиткой НАД спредом

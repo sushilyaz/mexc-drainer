@@ -48,19 +48,19 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
             if (text.startsWith("/start")) {
                 tg.reply(chatId, """
                         Привет! Я бот для перелива через спред на MEXC.
-
+                        
                         Команды:
                         /setA <apiKey> <secretKey> — задать ключи Аккаунта A (С КОТОРОГО переливаем)
                         /setB <apiKey> <secretKey> — задать ключи Аккаунта B (НА КОТОРЫЙ переливаем)
-
+                        
                         Режимы перелива:
                         1) Простой:   /drain <SYMBOL> <USDT>
                            пример: /drain ANTUSDT 5
-
+                        
                         2) В диапазоне: /drain <SYMBOL> <LOW> <HIGH> <USDT>
                            пример: /drain ANTUSDT 0,000010 0,000020 5
                            Цены можно писать с запятой или точкой.
-
+                        
                         ⚠️ Ключи хранятся только в памяти процесса и пропадут при перезапуске.
                         """);
                 return;
@@ -115,7 +115,7 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                 // --- Режим 2: новый диапазон (/drain SYMBOL LOW HIGH USDT)
                 if (p.length == 5) {
                     final String symbol = p[1].toUpperCase();
-                    final BigDecimal low  = parseDecimalSafe(p[2]);
+                    final BigDecimal low = parseDecimalSafe(p[2]);
                     final BigDecimal high = parseDecimalSafe(p[3]);
                     final BigDecimal usdt = parseDecimalSafe(p[4]);
 
@@ -167,6 +167,44 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                         """);
                 return;
             }
+
+            if (text.equals("/stop")) {
+                try {
+                    rangeDrainService.stopRange(chatId);
+                    tg.reply(chatId, "⏸️ Пауза включена. Текущий цикл остановится без принудительных продаж/отмен.");
+                } catch (Exception e) {
+                    tg.reply(chatId, "❌ Ошибка при остановке: " + e.getMessage());
+                }
+                return;
+            }
+
+            if (text.startsWith("/continue")) {
+                String[] p = text.split("\\s+");
+                if (p.length != 3) {
+                    tg.reply(chatId, "Формат: /continue <LOW> <HIGH>\nПример: /continue 0,000057 0,0000585");
+                    return;
+                }
+                BigDecimal low = parseDecimalSafe(p[1]);
+                BigDecimal high = parseDecimalSafe(p[2]);
+                if (low == null || high == null || low.compareTo(high) >= 0) {
+                    tg.reply(chatId, "Неверные границы. Пример: /continue 0,000057 0,0000585");
+                    return;
+                }
+
+                // Запустить "продолжение" в отдельном потоке, чтобы не блокировать телеграм-пуллинг
+                new Thread(() -> {
+                    try {
+                        rangeDrainService.continueRange(chatId, low, high);
+                        tg.reply(chatId, "▶️ Продолжаю в вилке [%s .. %s] (остаток цели из состояния)"
+                                .formatted(low.stripTrailingZeros(), high.stripTrailingZeros()));
+                    } catch (Exception e) {
+                        tg.reply(chatId, "❌ Ошибка /continue: " + e.getMessage());
+                    }
+                }, "continue-range-" + chatId).start();
+
+                return;
+            }
+
 
             tg.reply(chatId, "Неизвестная команда. Наберите /start");
 
