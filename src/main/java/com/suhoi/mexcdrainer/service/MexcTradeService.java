@@ -451,11 +451,6 @@ public class MexcTradeService {
         return orderId;
     }
 
-    // Старая сигнатура — оставлена как обёртка
-    public String placeLimitBuyAccountA(String symbol, BigDecimal price, BigDecimal usdtAmount, Long chatId) {
-        return placeLimitBuyAccountA(symbol, price, usdtAmount, null, chatId);
-    }
-
     // === Планирование MARKET SELL B без отправки — чтобы согласовать с BUY A
     public BigDecimal planMarketSellQtyAccountB(String symbol, BigDecimal price, BigDecimal requestedQty, Long chatId) {
         var creds = MemoryDb.getAccountB(chatId);
@@ -800,8 +795,6 @@ public class MexcTradeService {
         }
     }
 
-    // Внутри MexcTradeService.java — ДОБАВИТЬ:
-
     public BigDecimal getUsdtBalanceAccountB(Long chatId) {
         var creds = MemoryDb.getAccountB(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
@@ -812,71 +805,7 @@ public class MexcTradeService {
      * Перегрузка: вернуть фактически выставленный quoteOrderQty (для счётчика).
      * Старая marketBuyFromAccountB(...) не трогаю.
      */
-    public BigDecimal marketBuyFromAccountB(String symbol, BigDecimal price, BigDecimal qty, Long chatId, boolean returnSpent) {
-        var creds = MemoryDb.getAccountB(chatId);
-        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
 
-        SymbolFilters f = getSymbolFilters(symbol);
-        int quoteScale = resolveQuoteScale(symbol, f);
-
-        BigDecimal requiredUsdt;
-        try {
-            requiredUsdt = addFeeUp(price.multiply(qty), TAKER_FEE, FEE_SAFETY);
-        } catch (Exception ex) {
-            log.warn("Ошибка расчёта requiredUsdt: {}", ex.getMessage(), ex);
-            requiredUsdt = BigDecimal.ZERO;
-        }
-
-        BigDecimal availableUsdt = getAssetBalance(creds.getApiKey(), creds.getSecret(), "USDT");
-        if (availableUsdt.compareTo(BigDecimal.ZERO) <= 0) {
-            log.warn("B не имеет USDT для покупки (available=0)");
-            return BigDecimal.ZERO;
-        }
-
-        BigDecimal quote = normalizeQuoteAmount(requiredUsdt.min(availableUsdt), quoteScale);
-
-        // проверка minNotional
-        BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
-        if (symbol.endsWith("USDT") && quote.compareTo(effMinNotional) < 0) {
-            log.warn("MARKET BUY[B] {}: quote={} < minNotional={} USDT — ордер НЕ отправлен.",
-                    symbol, quote.toPlainString(), effMinNotional.toPlainString());
-            return BigDecimal.ZERO;
-        }
-
-        Map<String, String> params = new LinkedHashMap<>();
-        params.put("symbol", symbol);
-        params.put("side", "BUY");
-        params.put("type", "MARKET");
-        params.put("quoteOrderQty", quote.toPlainString());
-
-        try {
-            signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
-            log.info("MARKET BUY[B] {}: отправил quoteOrderQty={}", symbol, quote.toPlainString());
-            return returnSpent ? quote : BigDecimal.ZERO;
-        } catch (RuntimeException ex) {
-            String msg = ex.getMessage() != null ? ex.getMessage() : "";
-            if (msg.contains("amount scale is invalid") || msg.contains("scale is invalid")) {
-                int[] fallbacks = {Math.min(quoteScale, 8), 6, 4, 2, 0};
-                for (int s : fallbacks) {
-                    if (s == quoteScale) continue;
-                    BigDecimal q2 = normalizeQuoteAmount(requiredUsdt.min(availableUsdt), s);
-                    if (symbol.endsWith("USDT") && q2.compareTo(effMinNotional) < 0) continue;
-                    log.warn("MARKET BUY[B] {}: ретрай с scale={}, quote={}", symbol, s, q2.toPlainString());
-                    params.put("quoteOrderQty", q2.toPlainString());
-                    try {
-                        signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
-                        return returnSpent ? q2 : BigDecimal.ZERO;
-                    } catch (RuntimeException ex2) {
-                        String m2 = ex2.getMessage() != null ? ex2.getMessage() : "";
-                        if (!(m2.contains("amount scale is invalid") || m2.contains("scale is invalid"))) {
-                            throw ex2;
-                        }
-                    }
-                }
-            }
-            throw ex;
-        }
-    }
 
     // ======= Тех. методы =======
     // --- DTO для открытых ордеров и глубины
