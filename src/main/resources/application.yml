@@ -13,3 +13,10 @@ app:
     maxCycles: 100
     takerFeePct: 0.0005
     safetySpendPct: 0.998
+  drain:
+    minSpreadTicks: 5
+    epsilonTicks: 1
+    maxRequotesPerLeg: 3
+    sleepBetweenRequotesMs: 120
+    depthLimit: 20
+    feeSafety: "0.0010"

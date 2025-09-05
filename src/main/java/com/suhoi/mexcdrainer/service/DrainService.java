@@ -1,164 +1,270 @@
+// src/main/java/com/suhoi/mexcdrainer/service/DrainService.java
 package com.suhoi.mexcdrainer.service;
 
+import com.suhoi.mexcdrainer.config.AppProperties;
+import com.suhoi.mexcdrainer.model.DrainSession;
 import com.suhoi.mexcdrainer.util.MemoryDb;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 
-/**
- * Сервис перелива USDT между двумя аккаунтами через монету с большим спредом.
- */
+import static java.lang.Thread.sleep;
+
 @Service
 @Slf4j
 @RequiredArgsConstructor
 public class DrainService {
 
     private final MexcTradeService mexcTradeService;
+    private final Reconciler reconciler;
+    private final AppProperties props;
+    private final TelegramService tg; // добавь бин
 
-    /**
-     * Запуск перелива
-     *
-     * @param symbol     тикер (например, ANTUSDT)
-     * @param usdtAmount сумма в USDT для перелива
-     * @param chatId     id чата Телеграма для обратной связи
-     */
     public void startDrain(String symbol, BigDecimal usdtAmount, Long chatId, int cycles) {
+        var flag = MemoryDb.getFlag(chatId);
+        if (!flag.compareAndSet(false, true)) {
+            tg.reply(chatId, "⏳ У тебя уже идёт перелив в этом чате.");
+            return;
+        }
+
         try {
             log.info("🚀 Запуск перелива: символ={}, сумма={} USDT", symbol, usdtAmount);
 
-            // ШАГ 1 MARKET BUY A (берём фактическое executedQty)
-            MexcTradeService.OrderInfo buyA = mexcTradeService.marketBuyAccountAFull(symbol, usdtAmount, chatId);
+            // STATE: покупка рынка на A — как было
+            var buyA = mexcTradeService.marketBuyAccountAFull(symbol, usdtAmount, chatId);
             if (buyA == null || buyA.executedQty().signum() <= 0) {
                 log.error("A ➡ Market BUY не дал executedQty. Статус={}", buyA == null ? "null" : buyA.status());
                 return;
             }
-            BigDecimal qtyTokens = buyA.executedQty();
-            log.info("A ➡ Купил на {} USDT, получил {} токенов (avg={})",
-                    buyA.cummQuoteQty().stripTrailingZeros().toPlainString(),
-                    qtyTokens.stripTrailingZeros().toPlainString(),
-                    buyA.avgPrice().stripTrailingZeros().toPlainString()
-            );
 
-            // 2) Циклы
+            var s = new DrainSession();
+            s.setSymbol(symbol);
+            s.setState(DrainSession.State.A_MKT_BUY_DONE);
+            s.setQtyA(buyA.executedQty());
+            MemoryDb.setSession(chatId, s);
+
+            tg.reply(chatId, "✅ A купил ~%s токенов @avg=%s".formatted(
+                    s.getQtyA().stripTrailingZeros(), buyA.avgPrice().stripTrailingZeros()));
+
             for (int i = 0; i < cycles; i++) {
-                log.info("🔄 Цикл {}/{}", i + 1, cycles);
-                qtyTokens = executeCycle(symbol, qtyTokens, chatId); // вернём фактический nextQty
-                if (qtyTokens == null || qtyTokens.compareTo(BigDecimal.ZERO) <= 0) {
+                s.setCycleIndex(i + 1);
+                BigDecimal next = executeCycleWithGuards(chatId, s);
+                if (s.getState() == DrainSession.State.AUTO_PAUSE) {
+                    tg.reply(chatId, "⏸ Автопауза: %s – %s".formatted(s.getReason(), s.getReasonDetails()));
+                    break;
+                }
+                if (next == null || next.signum() <= 0) {
                     log.warn("⚠ Следующий объём для цикла <= 0 — останавливаемся");
                     break;
                 }
+                s.setQtyA(next);
             }
 
         } catch (Exception e) {
             log.error("❌ Ошибка в startDrain", e);
+        } finally {
+            MemoryDb.getFlag(chatId).set(false);
         }
     }
 
-    /**
-     * Один цикл перелива, возвращает фактическое количество токенов A после лимитной покупки.
-     *
-     * @param symbol     тикер
-     * @param qtyTokens  сколько токенов продаём изначально (равно фактическому количеству A из прошлого шага)
-     * @param chatId     телеграм чат
-     * @return           фактически купленное A в конце цикла (executedQty лимитной покупки)
-     */
-    private BigDecimal executeCycle(String symbol, BigDecimal qtyTokens, Long chatId) {
+    private BigDecimal executeCycleWithGuards(Long chatId, DrainSession s) {
+        final String symbol = s.getSymbol();
+
         try {
             long tCycle = System.currentTimeMillis();
 
-            //  ШАГ 2 A продаёт лимиткой возле нижней границы
-            BigDecimal sellPrice = mexcTradeService.getNearLowerSpreadPrice(symbol);
-            log.info("🎯 A SELL лимитка: price={} (нижняя граница)", sellPrice.stripTrailingZeros().toPlainString());
+            // === A SELL возле нижней кромки (ex-self)
+            BigDecimal sellPrice = mexcTradeService.getNearLowerSpreadPrice(
+                    symbol, chatId, props.getDrain().getDepthLimit());
+            s.setPSell(sellPrice);
 
-            String sellOrderId = mexcTradeService.placeLimitSellAccountA(symbol, sellPrice, qtyTokens, chatId);
+            String sellOrderId = mexcTradeService.placeLimitSellAccountA(symbol, sellPrice, s.getQtyA(), chatId);
+            s.setSellOrderId(sellOrderId);
+            s.setState(DrainSession.State.A_SELL_PLACED);
             log.info("A ➡ SELL лимитка {} токенов @ {} (orderId={})",
-                    qtyTokens.stripTrailingZeros(), sellPrice.stripTrailingZeros(), sellOrderId);
+                    s.getQtyA().stripTrailingZeros(), sellPrice.stripTrailingZeros(), sellOrderId);
 
-            //  ШАГ 3  B покупает по рынку (на сумму ~ price*qty c учётом комиссии), чтобы заполнить A
-            log.info("🧮 План для B BUY: цена={} * qty={} ≈ {} USDT",
-                    sellPrice.stripTrailingZeros(), qtyTokens.stripTrailingZeros(),
-                    sellPrice.multiply(qtyTokens).stripTrailingZeros());
-            mexcTradeService.marketBuyFromAccountB(symbol, sellPrice, qtyTokens, chatId);
-            log.info("B ➡ BUY market ~{} токенов @ {} (на сумму ~с учётом комиссии)",
-                    qtyTokens.stripTrailingZeros(), sellPrice.stripTrailingZeros());
-
-            //  ШАГ 4  Дожидаемся FILLED по A-SELL, чтобы взять реальный usdtEarned
-            MexcTradeService.OrderInfo sellAInfo = null;
-            if (sellOrderId != null) {
-                var credsA = MemoryDb.getAccountA(chatId);
-                sellAInfo = mexcTradeService.waitUntilFilled(symbol, sellOrderId, credsA.getApiKey(), credsA.getSecret(), 6000);
-            }
-            if (sellAInfo == null || sellAInfo.executedQty().signum() <= 0) {
-                log.warn("A SELL не FILLED или executedQty=0. Статус={}", sellAInfo == null ? "null" : sellAInfo.status());
+            // --- Анти-вклинивание: до maxRequotesPerLeg раз убеждаемся, что мы — top ask (ex-self)
+            for (;;) {
+                var v = reconciler.checkAfterSellPlaced(symbol, chatId, s);
+                if (v == Reconciler.Verdict.OK) break;
+                if (v == Reconciler.Verdict.NEED_REQUOTE) {
+                    s.setRequotesSell(s.getRequotesSell() + 1);
+                    mexcTradeService.cancelOrderAccountA(symbol, s.getSellOrderId(), chatId);
+                    sleep(props.getDrain().getSleepBetweenRequotesMs());
+                    BigDecimal newPrice = mexcTradeService.getNearLowerSpreadPrice(
+                            symbol, chatId, props.getDrain().getDepthLimit());
+                    s.setPSell(newPrice);
+                    String newId = mexcTradeService.placeLimitSellAccountA(symbol, newPrice, s.getQtyA(), chatId);
+                    s.setSellOrderId(newId);
+                    log.warn("🔁 Переставил A-SELL на {}", newPrice.stripTrailingZeros());
+                    continue;
+                }
+                s.autoPause(DrainSession.AutoPauseReason.FRONT_RUN, "После A-SELL наша цена не топ ask.");
                 return BigDecimal.ZERO;
             }
-            BigDecimal usdtEarned = sellAInfo.cummQuoteQty(); // фактически пришло на A
-            log.info("📊 A получил от SELL {} USDT (executedQty={} @ avg={})",
-                    usdtEarned.stripTrailingZeros(),
-                    sellAInfo.executedQty().stripTrailingZeros(),
-                    sellAInfo.avgPrice().stripTrailingZeros());
 
-            //  ШАГ 5  A готовит лимитный BUY возле верхней границы,
-            //    НО сначала планируем, сколько реально сможет продать B (учёт stepSize/minNotional/остатка/комиссии)
-            BigDecimal buyPrice = mexcTradeService.getNearUpperSpreadPrice(symbol);
-            log.info("🎯 A BUY лимитка: планируем price={} (верхняя граница)", buyPrice.stripTrailingZeros().toPlainString());
+            // === B MARKET BUY (вернём фактически потраченный quote)
+            BigDecimal spent = mexcTradeService.marketBuyFromAccountB(symbol, s.getPSell(), s.getQtyA(), chatId, true);
+            s.setLastSpentB(spent);
+            s.setState(DrainSession.State.B_MKT_BUY_SENT);
+            log.info("B ➡ BUY market на ~{} USDT", spent == null ? "0" : spent.stripTrailingZeros().toPlainString());
 
-            // планируем финальное количество, которое сможет продать B по рынку
-            BigDecimal plannedSellQtyB = mexcTradeService.planMarketSellQtyAccountB(symbol, buyPrice, qtyTokens, chatId);
+            // Быстрая сверка факта на B (появилась база?)
+            var vBuy = reconciler.checkAfterBBuy(symbol, chatId, s);
+            if (vBuy != Reconciler.Verdict.OK) {
+                s.autoPause(DrainSession.AutoPauseReason.PARTIAL_MISMATCH, "После MARKET BUY на B база отсутствует.");
+                return BigDecimal.ZERO;
+            }
+
+            // === Ждём FILLED по A-SELL
+            var credsA = MemoryDb.getAccountA(chatId);
+            var sellAInfo = mexcTradeService.waitUntilFilled(symbol, s.getSellOrderId(), credsA.getApiKey(), credsA.getSecret(), 6000);
+            if (!"FILLED".equals(sellAInfo.status()) || sellAInfo.executedQty().signum() <= 0) {
+                s.autoPause(DrainSession.AutoPauseReason.TIMEOUT, "A SELL не FILLED (status=" + sellAInfo.status() + ")");
+                return BigDecimal.ZERO;
+            }
+            s.setLastCummA(sellAInfo.cummQuoteQty());
+            s.setState(DrainSession.State.A_SELL_FILLED);
+
+            // === A BUY возле верхней кромки (ex-self)
+            BigDecimal buyPrice = mexcTradeService.getNearUpperSpreadPrice(
+                    symbol, chatId, props.getDrain().getDepthLimit());
+            s.setPBuy(buyPrice);
+
+            // Планирование кол-ва под MARKET SELL B оставляем как было:
+            BigDecimal plannedSellQtyB = mexcTradeService.planMarketSellQtyAccountB(symbol, buyPrice, s.getQtyA(), chatId);
             if (plannedSellQtyB.compareTo(BigDecimal.ZERO) <= 0) {
-                log.warn("B не может выставить MARKET SELL ≥ minNotional. Прерываем цикл.");
+                s.autoPause(DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE, "B не может выставить MARKET SELL ≥ minNotional.");
                 return BigDecimal.ZERO;
             }
 
-            // оставим чуть USDT на возможную maker-комиссию при лимитном BUY A
-            BigDecimal spendA = mexcTradeService.reserveForMakerFee(usdtEarned);
-            // не покупаем больше, чем B реально сольёт
+            BigDecimal spendA = mexcTradeService.reserveForMakerFee(s.getLastCummA());
             BigDecimal capByQty = buyPrice.multiply(plannedSellQtyB);
             if (spendA.compareTo(capByQty) > 0) spendA = capByQty;
 
             String buyOrderId = mexcTradeService.placeLimitBuyAccountA(symbol, buyPrice, spendA, plannedSellQtyB, chatId);
-            log.info("A ➡ BUY лимитка на {} USDT @ {} (maxQty={} ; orderId={})",
+            s.setBuyOrderId(buyOrderId);
+            s.setState(DrainSession.State.A_BUY_PLACED);
+            log.info("A ➡ BUY лимитка {} USDT @ {} (maxQty={} ; orderId={})",
                     spendA.stripTrailingZeros(), buyPrice.stripTrailingZeros(),
                     plannedSellQtyB.stripTrailingZeros(), buyOrderId);
 
-            //  ШАГ 6  B продаёт по рынку ровно то количество, которое мы заложили в BUY A
-            mexcTradeService.marketSellFromAccountB(symbol, buyPrice, plannedSellQtyB, chatId);
-            log.info("B ➡ SELL market {} токенов @ {}", plannedSellQtyB.stripTrailingZeros(), buyPrice.stripTrailingZeros());
-
-            //  ШАГ 7  Дожидаемся FILLED по A-BUY, возвращаем фактическое количество на следующий цикл
-            MexcTradeService.OrderInfo buyAInfo = null;
-            if (buyOrderId != null) {
-                var credsA = MemoryDb.getAccountA(chatId);
-                buyAInfo = mexcTradeService.waitUntilFilled(symbol, buyOrderId, credsA.getApiKey(), credsA.getSecret(), 6000);
+            // --- Анти-вклинивание на bid
+            for (;;) {
+                var v = reconciler.checkAfterBuyPlaced(symbol, chatId, s);
+                if (v == Reconciler.Verdict.OK) break;
+                if (v == Reconciler.Verdict.NEED_REQUOTE) {
+                    s.setRequotesBuy(s.getRequotesBuy() + 1);
+                    mexcTradeService.cancelOrderAccountA(symbol, s.getBuyOrderId(), chatId);
+                    sleep(props.getDrain().getSleepBetweenRequotesMs());
+                    BigDecimal np = mexcTradeService.getNearUpperSpreadPrice(
+                            symbol, chatId, props.getDrain().getDepthLimit());
+                    s.setPBuy(np);
+                    String newId = mexcTradeService.placeLimitBuyAccountA(symbol, np, spendA, plannedSellQtyB, chatId);
+                    s.setBuyOrderId(newId);
+                    log.warn("🔁 Переставил A-BUY на {}", np.stripTrailingZeros());
+                    continue;
+                }
+                s.autoPause(DrainSession.AutoPauseReason.FRONT_RUN, "После A-BUY наш bid не топ.");
+                return BigDecimal.ZERO;
             }
-            if (buyAInfo == null || buyAInfo.executedQty().signum() <= 0) {
-                log.warn("A BUY не FILLED или executedQty=0. Статус={}", buyAInfo == null ? "null" : buyAInfo.status());
+
+            // === B MARKET SELL
+            mexcTradeService.marketSellFromAccountB(symbol, buyPrice, plannedSellQtyB, chatId);
+            s.setState(DrainSession.State.B_MKT_SELL_SENT);
+
+            // Сверка «после B SELL»
+            var vSell = reconciler.checkAfterBSell(symbol, chatId, s);
+            if (vSell != Reconciler.Verdict.OK) {
+                s.autoPause(DrainSession.AutoPauseReason.PARTIAL_MISMATCH, "После MARKET SELL на B осталась не-пыль.");
+                return BigDecimal.ZERO;
+            }
+
+            // === Ждём FILLED по A-BUY
+            var buyAInfo = mexcTradeService.waitUntilFilled(symbol, s.getBuyOrderId(), credsA.getApiKey(), credsA.getSecret(), 6000);
+            if (!"FILLED".equals(buyAInfo.status()) || buyAInfo.executedQty().signum() <= 0) {
+                s.autoPause(DrainSession.AutoPauseReason.TIMEOUT, "A BUY не FILLED (status=" + buyAInfo.status() + ")");
                 return BigDecimal.ZERO;
             }
 
             long dt = System.currentTimeMillis() - tCycle;
-            log.info("✅ Цикл завершён за {} ms. A получил {} токенов (avg={}), потратил {} USDT.",
+            log.info("✅ Цикл {} завершён за {} ms. A получил {} токенов (avg={}), потратил {} USDT.",
+                    s.getCycleIndex(),
                     dt,
                     buyAInfo.executedQty().stripTrailingZeros().toPlainString(),
                     buyAInfo.avgPrice().stripTrailingZeros().toPlainString(),
                     buyAInfo.cummQuoteQty().stripTrailingZeros().toPlainString());
 
+            s.setState(DrainSession.State.A_BUY_FILLED);
             return buyAInfo.executedQty();
 
         } catch (Exception e) {
-            log.error("❌ Ошибка в executeCycle", e);
+            log.error("❌ Ошибка в executeCycleWithGuards", e);
             try {
-                BigDecimal tokensA = mexcTradeService.getTokenBalanceAccountA(symbol, chatId);
+                BigDecimal tokensA = mexcTradeService.getTokenBalanceAccountA(s.getSymbol(), chatId);
                 if (tokensA.compareTo(BigDecimal.ZERO) > 0) {
-                    mexcTradeService.forceMarketSellAccountA(symbol, tokensA, chatId);
+                    mexcTradeService.forceMarketSellAccountA(s.getSymbol(), tokensA, chatId);
                 }
             } catch (Exception ex) {
-                throw new RuntimeException(ex);
+                log.error("Не удалось аварийно продать остаток A: {}", ex.getMessage());
             }
+            s.autoPause(DrainSession.AutoPauseReason.UNKNOWN, e.getClass().getSimpleName());
             return BigDecimal.ZERO;
         }
+    }
+
+    // Ручная пауза
+    public void requestStop(Long chatId) {
+        var s = MemoryDb.getSession(chatId);
+        if (s == null) return;
+        s.autoPause(DrainSession.AutoPauseReason.MANUAL, "Остановлено пользователем.");
+    }
+
+    // Продолжить из факта балансов: A должен иметь базу ≥ minQty, B — пыль
+    public void continueFromBalances(String symbol, Long chatId, int cycles) {
+        var flag = MemoryDb.getFlag(chatId);
+        if (!flag.compareAndSet(false, true)) {
+            tg.reply(chatId, "⏳ Уже идёт перелив в этом чате.");
+            return;
+        }
+        try {
+            var s = new DrainSession();
+            s.setSymbol(symbol);
+
+            var f = mexcTradeService.getSymbolFilters(symbol);
+            BigDecimal aBase = mexcTradeService.getTokenBalanceAccountA(symbol, chatId);
+            if (aBase.compareTo(f.minQty) < 0) {
+                tg.reply(chatId, "❌ На A мало базового токена для продолжения (нужно ≥ minQty).");
+                return;
+            }
+            s.setQtyA(aBase);
+            s.setState(DrainSession.State.A_MKT_BUY_DONE);
+            MemoryDb.setSession(chatId, s);
+
+            for (int i = 0; i < cycles; i++) {
+                s.setCycleIndex(i + 1);
+                BigDecimal next = executeCycleWithGuards(chatId, s);
+                if (s.getState() == DrainSession.State.AUTO_PAUSE) {
+                    tg.reply(chatId, "⏸ Автопауза: %s – %s".formatted(s.getReason(), s.getReasonDetails()));
+                    break;
+                }
+                if (next == null || next.signum() <= 0) break;
+                s.setQtyA(next);
+            }
+        } finally {
+            MemoryDb.getFlag(chatId).set(false);
+        }
+    }
+
+    public String status(Long chatId) {
+        var s = MemoryDb.getSession(chatId);
+        if (s == null) return "Статус: нет активной сессии.";
+        return "Статус: %s | цикл %d | pSell=%s | pBuy=%s | reason=%s (%s)".formatted(
+                s.getState(), s.getCycleIndex(),
+                s.getPSell(), s.getPBuy(),
+                s.getReason(), s.getReasonDetails());
     }
 }

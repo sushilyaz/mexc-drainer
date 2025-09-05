@@ -85,17 +85,40 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                 return;
             }
 
-            if (text.startsWith("/drain")) {
+            if (text.startsWith("/status")) {
+                String s = drainService.status(chatId);
+                tg.reply(chatId, s);
+                return;
+            }
+
+            if (text.startsWith("/stop")) {
+                drainService.requestStop(chatId);
+                tg.reply(chatId, "⏸ Поставил на паузу (MANUAL).");
+                return;
+            }
+
+            if (text.startsWith("/continue")) {
                 String[] p = text.split("\\s+");
-                // Проверим наличие ключей заранее
+                if (p.length < 2) {
+                    tg.reply(chatId, "Формат: /continue <SYMBOL> [cycles]\nпример: /continue ANTUSDT 20");
+                    return;
+                }
+                String symbol = p[1].toUpperCase();
+                int cycles = (p.length >= 3) ? Integer.parseInt(p[2]) : 20;
+                tg.reply(chatId, "▶️ Продолжаю из фактических балансов по %s".formatted(symbol));
+                drainService.continueFromBalances(symbol, chatId, cycles);
+                return;
+            }
+
+            if (text.startsWith("/drain")) {
+                // как у тебя, плюс проверка ключей ...
+                String[] p = text.split("\\s+");
                 var a = MemoryDb.getAccountA(chatId);
                 var b = MemoryDb.getAccountB(chatId);
                 if (a == null || b == null) {
                     tg.reply(chatId, "Сначала задайте ключи: /setA и /setB");
                     return;
                 }
-
-                // --- Режим 1: старый (/drain SYMBOL USDT)
                 if (p.length == 3) {
                     final String symbol = p[1].toUpperCase();
                     final BigDecimal usdt = parseDecimalSafe(p[2]);
@@ -104,20 +127,10 @@ public class TelegramBotHandler extends TelegramLongPollingBot {
                         return;
                     }
                     tg.reply(chatId, "▶️ Запускаю перелив: %s на %s USDT".formatted(symbol, usdt.stripTrailingZeros()));
-                    // Синхронно, как у тебя и было (можно вынести в отдельный executor, если захочешь)
                     drainService.startDrain(symbol, usdt, chatId, 20);
                     return;
                 }
-
-                // Если формат не распознан
-                tg.reply(chatId, """
-                        Неверный формат. Используйте:
-                        /drain <SYMBOL> <USDT>  или
-                        /drain <SYMBOL> <LOW> <HIGH> <USDT>
-                        Примеры:
-                        /drain ANTUSDT 5
-                        /drain ANTUSDT 0,000010 0,000020 5
-                        """);
+                tg.reply(chatId, "Неверный формат. Пример: /drain ANTUSDT 5");
                 return;
             }
 
