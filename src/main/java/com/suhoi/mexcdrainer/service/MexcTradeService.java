@@ -1341,7 +1341,7 @@ public class MexcTradeService {
         }
         BigDecimal spread = top.ask().subtract(top.bid());
         if (spread.signum() < 0) spread = BigDecimal.ZERO;
-        BigDecimal raw = top.bid().add(spread.multiply(new BigDecimal("0.01")));
+        BigDecimal raw = top.bid().add(spread.multiply(new BigDecimal("0.1")));
         BigDecimal price = alignPriceCeil(symbol, raw);
         log.info("getNearLowerSpreadPrice(ex-self)[{}]: bid={} ask={} -> {}", symbol,
                 top.bid().stripTrailingZeros(), top.ask().stripTrailingZeros(), price.stripTrailingZeros());
@@ -1356,11 +1356,153 @@ public class MexcTradeService {
         }
         BigDecimal spread = top.ask().subtract(top.bid());
         if (spread.signum() < 0) spread = BigDecimal.ZERO;
-        BigDecimal raw = top.ask().subtract(spread.multiply(new BigDecimal("0.01")));
+        BigDecimal raw = top.ask().subtract(spread.multiply(new BigDecimal("0.1")));
         BigDecimal price = alignPriceFloor(symbol, raw);
         log.info("getNearUpperSpreadPrice(ex-self)[{}]: bid={} ask={} -> {}", symbol,
                 top.bid().stripTrailingZeros(), top.ask().stripTrailingZeros(), price.stripTrailingZeros());
         return price;
+    }
+
+    public record PlacedOrder(String orderId, BigDecimal price, BigDecimal qty) {}
+    // MexcTradeService.java — внутрь класса
+    public PlacedOrder placeLimitBuyAccountAPlaced(String symbol,
+                                                   BigDecimal price,
+                                                   BigDecimal usdtAmount,
+                                                   BigDecimal maxQty,
+                                                   Long chatId) {
+        var creds = MemoryDb.getAccountA(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
+
+        SymbolFilters f = getSymbolFilters(symbol);
+        BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
+
+        // нормализация цены + guard ВВЕРХ (для BUY мы не должны перепрыгивать сильно выше рынка)
+        BigDecimal normPrice = normalizePrice(price, f);
+        normPrice = guardBuyPrice(symbol, normPrice);
+
+        // сырой qty по бюджету
+        BigDecimal rawQty = BigDecimal.ZERO;
+        try {
+            rawQty = usdtAmount.divide(normPrice, 18, RoundingMode.DOWN);
+        } catch (Exception ignore) { }
+        BigDecimal qty = normalizeQty(rawQty, f);
+
+        // ограничиваем сверху maxQty (если задан)
+        if (maxQty != null && maxQty.signum() > 0) {
+            BigDecimal maxNorm = normalizeQty(maxQty, f);
+            if (qty.compareTo(maxNorm) > 0) qty = maxNorm;
+        }
+
+        // minNotional/minQty
+        BigDecimal minQtyNeed = minQtyForNotional(normPrice, f.stepSize, effMinNotional);
+        if (qty.compareTo(minQtyNeed) < 0) {
+            BigDecimal needCost = minQtyNeed.multiply(normPrice);
+            if (needCost.compareTo(usdtAmount) <= 0 && (maxQty == null || minQtyNeed.compareTo(maxQty) <= 0)) {
+                qty = minQtyNeed;
+            } else {
+                log.warn("BUY {}: бюджет {} USDT < требуемого {} (нужно {} USDT). Ордер НЕ отправлен.",
+                        symbol,
+                        usdtAmount.stripTrailingZeros().toPlainString(),
+                        effMinNotional.stripTrailingZeros().toPlainString(),
+                        needCost.stripTrailingZeros().toPlainString());
+                return new PlacedOrder(null, normPrice, BigDecimal.ZERO);
+            }
+        }
+
+        // не выходим за бюджет
+        BigDecimal cost = qty.multiply(normPrice);
+        if (cost.compareTo(usdtAmount) > 0) {
+            qty = normalizeQty(usdtAmount.divide(normPrice, 18, RoundingMode.DOWN), f);
+            if (maxQty != null && maxQty.signum() > 0) {
+                BigDecimal maxNorm = normalizeQty(maxQty, f);
+                if (qty.compareTo(maxNorm) > 0) qty = maxNorm;
+            }
+            cost = qty.multiply(normPrice);
+        }
+
+        if (qty.signum() <= 0) {
+            log.warn("placeLimitBuyAccountAPlaced: qty<=0 (budget={}, price={}, stepSize={})",
+                    usdtAmount, normPrice, f.stepSize);
+            return new PlacedOrder(null, normPrice, BigDecimal.ZERO);
+        }
+
+        log.info("BUY {} финал: price={} qty={} cost={} | rawQty={} budget={} | minNotional(eff)={} minQtyForNotional={} tickSize={} stepSize={}",
+                symbol,
+                normPrice.toPlainString(), qty.toPlainString(), cost.stripTrailingZeros().toPlainString(),
+                rawQty.stripTrailingZeros().toPlainString(), usdtAmount.stripTrailingZeros().toPlainString(),
+                effMinNotional.stripTrailingZeros().toPlainString(), minQtyNeed.toPlainString(),
+                f.tickSize.stripTrailingZeros().toPlainString(), f.stepSize.stripTrailingZeros().toPlainString());
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "BUY");
+        params.put("type", "LIMIT");
+        params.put("timeInForce", "GTC");
+        params.put("quantity", qty.toPlainString());
+        params.put("price", normPrice.toPlainString());
+        params.put("newOrderRespType", "ACK");
+
+        JsonNode resp;
+        try {
+            resp = signedRequest("POST", API_PREFIX + "/order", params, creds.getApiKey(), creds.getSecret());
+        } catch (RuntimeException ex) {
+            String msg = ex.getMessage() == null ? "" : ex.getMessage();
+            if (msg.contains("\"code\":30087")) {
+                BigDecimal bumped = guardBuyPrice(symbol, normPrice.add(f.tickSize.multiply(BigDecimal.valueOf(
+                        appProperties.getDrain().getEpsilonTicks()
+                ))));
+                if (bumped.compareTo(normPrice) > 0) {
+                    log.warn("BUY {}: code=30087 — повышаю price {} -> {}", symbol, normPrice, bumped);
+                    params.put("price", bumped.toPlainString());
+                    resp = signedRequest("POST", API_PREFIX + "/order", params, creds.getApiKey(), creds.getSecret());
+                    normPrice = bumped; // фиксируем фактическую цену
+                } else {
+                    throw ex;
+                }
+            } else {
+                throw ex;
+            }
+        }
+
+        String orderId = (resp != null && resp.has("orderId")) ? resp.get("orderId").asText() : null;
+        log.info("📤 BUY {} размещён: orderId={}, price={}, qty={}, cost~{}",
+                symbol, orderId, normPrice.toPlainString(), qty.toPlainString(), cost.stripTrailingZeros().toPlainString());
+
+        return new PlacedOrder(orderId, normPrice.stripTrailingZeros(), qty.stripTrailingZeros());
+    }
+
+    public PlacedOrder placeLimitSellAccountAPlaced(String symbol, BigDecimal price, BigDecimal qty, Long chatId) {
+        var creds = MemoryDb.getAccountA(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountA");
+
+        SymbolFilters f = getSymbolFilters(symbol);
+        BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
+
+        BigDecimal normPrice = normalizePrice(price, f);
+        normPrice = guardSellPrice(symbol, normPrice);     // <— вот здесь цена может вырасти
+        BigDecimal normQty   = normalizeQty(qty, f);
+
+        BigDecimal notional  = normPrice.multiply(normQty);
+        BigDecimal minQtyNeed= minQtyForNotional(normPrice, f.stepSize, effMinNotional);
+        if (normQty.compareTo(minQtyNeed) < 0 || normQty.compareTo(f.minQty) < 0) {
+            log.warn("SELL {}: qty {} не проходит minNotional/minQty", symbol, normQty);
+            return new PlacedOrder(null, normPrice, normQty);
+        }
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "SELL");
+        params.put("type", "LIMIT");
+        params.put("timeInForce", "GTC");
+        params.put("quantity", normQty.toPlainString());
+        params.put("price", normPrice.toPlainString());
+        params.put("newOrderRespType", "ACK");
+
+        var resp = signedRequest("POST", "/api/v3/order", params, creds.getApiKey(), creds.getSecret());
+        String orderId = resp.path("orderId").asText(null);
+        log.info("📤 SELL {} размещён: orderId={}, price={}, qty={}, notional~{}",
+                symbol, orderId, normPrice, normQty, notional.stripTrailingZeros());
+        return new PlacedOrder(orderId, normPrice, normQty);
     }
 
     /**
@@ -1620,7 +1762,7 @@ public class MexcTradeService {
         BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
 
         // Цена над спредом — несколько тиков выше ask
-        final int ticksAbove = 3;
+        final int ticksAbove = 10;
         BigDecimal price = priceAboveAsk(symbol, ticksAbove);
 
         // Считаем количество «с запасом вниз», чтобы не выйти за бюджет
