@@ -20,3 +20,4 @@ app:
     sleepBetweenRequotesMs: 120
     depthLimit: 20
     feeSafety: "0.0010"
+    priceGuardPct: "0.08"

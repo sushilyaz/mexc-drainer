@@ -9,6 +9,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.util.Map;
 
 import static java.lang.Thread.sleep;
 
@@ -83,26 +84,29 @@ public class DrainService {
             String sellOrderId = mexcTradeService.placeLimitSellAccountA(symbol, sellPrice, s.getQtyA(), chatId);
             s.setSellOrderId(sellOrderId);
             s.setState(DrainSession.State.A_SELL_PLACED);
+            var cfg = props.getDrain();
+            var rqSell = mexcTradeService.ensureTopAskOrRequoteSell(
+                    symbol, chatId,
+                    s.getSellOrderId(), s.getPSell(), s.getQtyA(),
+                    cfg.getMaxRequotesPerLeg(),
+                    cfg.getEpsilonTicks(),
+                    cfg.getDepthLimit(),
+                    cfg.getPostPlaceGraceMs()
+            );
+            if (!rqSell.ok()) {
+                s.setState(DrainSession.State.AUTO_PAUSE);
+                // тут твой tgNotifyAutoPause(...) — можно вложить rqSell.reason()/ex/inc в сообщение
+                return BigDecimal.ZERO;
+            }
+            s.setSellOrderId(rqSell.orderId());
+            s.setPSell(rqSell.price());
             log.info("A ➡ SELL лимитка {} токенов @ {} (orderId={})",
                     s.getQtyA().stripTrailingZeros(), sellPrice.stripTrailingZeros(), sellOrderId);
 
-            // --- Анти-вклинивание: до maxRequotesPerLeg раз убеждаемся, что мы — top ask (ex-self)
-            for (;;) {
-                var v = reconciler.checkAfterSellPlaced(symbol, chatId, s);
-                if (v == Reconciler.Verdict.OK) break;
-                if (v == Reconciler.Verdict.NEED_REQUOTE) {
-                    s.setRequotesSell(s.getRequotesSell() + 1);
-                    mexcTradeService.cancelOrderAccountA(symbol, s.getSellOrderId(), chatId);
-                    sleep(props.getDrain().getSleepBetweenRequotesMs());
-                    BigDecimal newPrice = mexcTradeService.getNearLowerSpreadPrice(
-                            symbol, chatId, props.getDrain().getDepthLimit());
-                    s.setPSell(newPrice);
-                    String newId = mexcTradeService.placeLimitSellAccountA(symbol, newPrice, s.getQtyA(), chatId);
-                    s.setSellOrderId(newId);
-                    log.warn("🔁 Переставил A-SELL на {}", newPrice.stripTrailingZeros());
-                    continue;
-                }
-                s.autoPause(DrainSession.AutoPauseReason.FRONT_RUN, "После A-SELL наша цена не топ ask.");
+            var vBuyPlaced = reconciler.checkAfterBuyPlaced(symbol, chatId, s);
+            if (vBuyPlaced != Reconciler.Verdict.OK) {
+                s.autoPause(DrainSession.AutoPauseReason.FRONT_RUN,
+                        "После A-BUY наш bid не топ (верификация).");
                 return BigDecimal.ZERO;
             }
 
@@ -151,27 +155,30 @@ public class DrainService {
             log.info("A ➡ BUY лимитка {} USDT @ {} (maxQty={} ; orderId={})",
                     spendA.stripTrailingZeros(), buyPrice.stripTrailingZeros(),
                     plannedSellQtyB.stripTrailingZeros(), buyOrderId);
+            cfg = props.getDrain();
+            var rqBuy = mexcTradeService.ensureTopBidOrRequoteBuy(
+                    symbol, chatId,
+                    s.getBuyOrderId(), s.getPBuy(),
+                    spendA, plannedSellQtyB,                 // важно: те же бюджет и maxQty
+                    cfg.getMaxRequotesPerLeg(),
+                    cfg.getEpsilonTicks(),
+                    cfg.getDepthLimit(),
+                    cfg.getPostPlaceGraceMs()
+            );
 
-            // --- Анти-вклинивание на bid
-            for (;;) {
-                var v = reconciler.checkAfterBuyPlaced(symbol, chatId, s);
-                if (v == Reconciler.Verdict.OK) break;
-                if (v == Reconciler.Verdict.NEED_REQUOTE) {
-                    s.setRequotesBuy(s.getRequotesBuy() + 1);
-                    mexcTradeService.cancelOrderAccountA(symbol, s.getBuyOrderId(), chatId);
-                    sleep(props.getDrain().getSleepBetweenRequotesMs());
-                    BigDecimal np = mexcTradeService.getNearUpperSpreadPrice(
-                            symbol, chatId, props.getDrain().getDepthLimit());
-                    s.setPBuy(np);
-                    String newId = mexcTradeService.placeLimitBuyAccountA(symbol, np, spendA, plannedSellQtyB, chatId);
-                    s.setBuyOrderId(newId);
-                    log.warn("🔁 Переставил A-BUY на {}", np.stripTrailingZeros());
-                    continue;
-                }
-                s.autoPause(DrainSession.AutoPauseReason.FRONT_RUN, "После A-BUY наш bid не топ.");
+            if (!rqBuy.ok()) {
+                s.setState(DrainSession.State.AUTO_PAUSE);
+                // tgNotifyAutoPause(...) с деталями rqBuy
                 return BigDecimal.ZERO;
             }
-
+            s.setBuyOrderId(rqBuy.orderId());
+            s.setPBuy(rqBuy.price());
+            var vSellPlaced = reconciler.checkAfterSellPlaced(symbol, chatId, s);
+            if (vSellPlaced != Reconciler.Verdict.OK) {
+                s.autoPause(DrainSession.AutoPauseReason.FRONT_RUN,
+                        "После A-SELL наша цена не топ ask (верификация).");
+                return BigDecimal.ZERO;
+            }
             // === B MARKET SELL
             mexcTradeService.marketSellFromAccountB(symbol, buyPrice, plannedSellQtyB, chatId);
             s.setState(DrainSession.State.B_MKT_SELL_SENT);

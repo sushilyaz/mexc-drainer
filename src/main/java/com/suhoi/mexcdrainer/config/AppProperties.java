@@ -29,5 +29,7 @@ public class AppProperties {
         private int sleepBetweenRequotesMs = 120;
         private int depthLimit = 20;
         private String feeSafety = "0.0010"; // строкой, чтобы биндинг BigDecimal был надёжным
+        private String priceGuardPct = "0.08"; // ±8% коридор от lastPrice
+        private int postPlaceGraceMs = 220;
     }
 }
