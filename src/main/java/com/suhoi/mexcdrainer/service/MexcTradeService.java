@@ -1676,6 +1676,126 @@ public class MexcTradeService {
             }
         }
     }
+    // Быстрый выкуп А-SELL: LIMIT IOC BUY на аккаунте B
+    public void limitIocBuyFromAccountB(String symbol, BigDecimal targetPrice, BigDecimal requestedQty, Long chatId) {
+        var creds = MemoryDb.getAccountB(chatId);
+        if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
+
+        // 1) Фильтры/сетка
+        SymbolFilters f = getSymbolFilters(symbol);
+        BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
+
+        // Цена: не опускаться ниже целевой (наш A-SELL), добавить небольшой epsilon в тиках, чтобы точно перекреститься
+        BigDecimal price = targetPrice == null ? BigDecimal.ZERO : targetPrice;
+        price = alignPriceCeil(symbol, price); // гарантия, что не ниже targetPrice из-за округления
+        int eps = 0;
+        try { eps = Math.max(0, appProperties.getDrain().getEpsilonTicks()); } catch (Exception ignore) {}
+        if (eps > 0) {
+            price = alignPriceCeil(symbol, price.add(f.tickSize.multiply(BigDecimal.valueOf(eps))));
+        }
+
+        // Кол-во по сетке лота
+        BigDecimal qty = normalizeQty(requestedQty, f);
+        if (qty.signum() <= 0) {
+            log.warn("LIMIT BUY[B][IOC] {}: qty<=0 после нормализации (requested={}, stepSize={})",
+                    symbol,
+                    requestedQty == null ? "null" : requestedQty.stripTrailingZeros().toPlainString(),
+                    f.stepSize.stripTrailingZeros().toPlainString());
+            return;
+        }
+
+        // 2) Проверка minNotional: если мало — попробуем поднять qty до minQtyNeed (если хватит USDT)
+        BigDecimal minQtyNeed = minQtyForNotional(price, f.stepSize, effMinNotional);
+        if (minQtyNeed.compareTo(BigDecimal.ZERO) > 0 && qty.compareTo(minQtyNeed) < 0) {
+            qty = minQtyNeed;
+            qty = normalizeQty(qty, f); // защита на сетку шага
+        }
+
+        // 3) Бюджет USDT на B (с учётом комиссии TAKER и safety-запаса)
+        BigDecimal availableUsdt = getAssetBalance(creds.getApiKey(), creds.getSecret(), "USDT");
+        BigDecimal requiredUsdt = addFeeUp(price.multiply(qty), TAKER_FEE, FEE_SAFETY);
+        if (availableUsdt.compareTo(requiredUsdt) < 0) {
+            // урезаем qty под бюджет
+            BigDecimal denom = addFeeUp(price, TAKER_FEE, FEE_SAFETY);
+            BigDecimal maxQtyByBudget = denom.signum() > 0
+                    ? availableUsdt.divide(denom, 18, RoundingMode.DOWN)
+                    : BigDecimal.ZERO;
+            maxQtyByBudget = normalizeQty(maxQtyByBudget, f);
+
+            if (maxQtyByBudget.signum() <= 0) {
+                log.warn("LIMIT BUY[B][IOC] {}: недостаточно USDT (available={}, need={})",
+                        symbol,
+                        availableUsdt.stripTrailingZeros().toPlainString(),
+                        requiredUsdt.stripTrailingZeros().toPlainString());
+                return;
+            }
+            // и снова убедимся, что не сломали minNotional
+            if (effMinNotional.signum() > 0 && price.multiply(maxQtyByBudget).compareTo(effMinNotional) < 0) {
+                log.warn("LIMIT BUY[B][IOC] {}: бюджет не покрывает minNotional (price*qty={} < {}).",
+                        symbol,
+                        price.multiply(maxQtyByBudget).stripTrailingZeros().toPlainString(),
+                        effMinNotional.stripTrailingZeros().toPlainString());
+                return;
+            }
+            qty = maxQtyByBudget;
+            requiredUsdt = addFeeUp(price.multiply(qty), TAKER_FEE, FEE_SAFETY);
+        }
+
+        BigDecimal notional = price.multiply(qty);
+        log.info("🟢 LIMIT BUY[B][IOC] {}: placing | price={} (+{}ε) | qty={} | estNotional~{} | minNotional(eff)={} | USDT avail/need={} / {}",
+                symbol,
+                price.stripTrailingZeros().toPlainString(),
+                eps,
+                qty.stripTrailingZeros().toPlainString(),
+                notional.stripTrailingZeros().toPlainString(),
+                effMinNotional.stripTrailingZeros().toPlainString(),
+                availableUsdt.stripTrailingZeros().toPlainString(),
+                requiredUsdt.stripTrailingZeros().toPlainString());
+
+        // 4) Отправляем LIMIT IOC (ACK, чтобы не ждать тяжёлый FULL), на редкий отказ IOC — fallback GTC c быстрым авто-канселом
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("symbol", symbol);
+        params.put("side", "BUY");
+        params.put("type", "LIMIT");
+        params.put("timeInForce", "IOC");
+        params.put("quantity", qty.toPlainString());
+        params.put("price", price.toPlainString());
+        params.put("newOrderRespType", "ACK");
+
+        JsonNode resp;
+        try {
+            resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
+            String orderId = resp.path("orderId").asText(null);
+            log.info("📤 LIMIT BUY[B][IOC] {} размещён: orderId={}, price={}, qty={}", symbol, orderId, price, qty);
+            // Быстро выходим — DrainService сам проверит факт (reconciler.checkAfterBBuy)
+            return;
+        } catch (RuntimeException ex) {
+            String msg = ex.getMessage() != null ? ex.getMessage().toLowerCase() : "";
+            // Некоторые аккаунты/символы у MEXC могут не принимать IOC — fallback: GTC + быстрый авто-кансел, если не исполнился
+            if (msg.contains("timeinforce")) {
+                log.warn("LIMIT BUY[B][IOC] {}: биржа не приняла IOC ({}). Пробую GTC c быстрым чек-и-кэнсел.", symbol, ex.getMessage());
+                params.put("timeInForce", "GTC");
+                params.put("newOrderRespType", "FULL");
+                JsonNode r2 = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
+                String orderId = r2.path("orderId").asText(null);
+                String status  = r2.path("status").asText("UNKNOWN");
+                BigDecimal exec = bd(r2.path("executedQty").asText("0"));
+                log.info("LIMIT BUY[B][GTC] {}#{} первичный ответ: status={}, executedQty={}", symbol, orderId, status, exec);
+
+                // Быстрый чек: если не финально — коротко подождём и отменим, чтобы не повисал buy на B
+                OrderInfo waited = "FILLED".equals(status) || "CANCELED".equals(status) || "REJECTED".equals(status)
+                        ? new OrderInfo(orderId, status, exec, bd(r2.path("cummulativeQuoteQty").asText("0")), safeAvg(bd(r2.path("cummulativeQuoteQty").asText("0")), exec))
+                        : waitUntilFilled(symbol, orderId, creds.getApiKey(), creds.getSecret(), 800);
+
+                if (!"FILLED".equals(waited.status())) {
+                    tryCancelOrder(symbol, orderId, creds.getApiKey(), creds.getSecret());
+                    log.warn("LIMIT BUY[B][GTC] {}#{} не FILLED (status={}) — отменил для чистоты быстрого пути.", symbol, orderId, waited.status());
+                }
+                return;
+            }
+            throw ex; // прочие ошибки — наружу (DrainService обработает и поставит авто-паузу)
+        }
+    }
 
     // -- Эффективный minNotional: если биржа не отдала, используем дефолт для USDT-пар
     private static BigDecimal resolveMinNotional(String symbol, BigDecimal exMinNotional) {
@@ -1762,7 +1882,7 @@ public class MexcTradeService {
         BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
 
         // Цена над спредом — несколько тиков выше ask
-        final int ticksAbove = 10;
+        final int ticksAbove = 40;
         BigDecimal price = priceAboveAsk(symbol, ticksAbove);
 
         // Считаем количество «с запасом вниз», чтобы не выйти за бюджет
