@@ -436,14 +436,14 @@ public class MexcTradeService {
         BigDecimal effMinNotional = resolveMinNotional(symbol, f.minNotional);
 
         BigDecimal normPrice = normalizePrice(price, f);
-        normPrice = guardSellPrice(symbol, normPrice);
+        // ВАЖНО: для BUY ограничиваем ВВЕРХ
+        normPrice = guardBuyPrice(symbol, normPrice);
 
         // сырой qty из бюджета (floor)
         BigDecimal rawQty = BigDecimal.ZERO;
         try {
             rawQty = usdtAmount.divide(normPrice, 18, RoundingMode.DOWN);
-        } catch (Exception ignore) {
-        }
+        } catch (Exception ignore) {}
         BigDecimal qty = normalizeQty(rawQty, f);
 
         // ограничим сверху maxQty (если задан)
@@ -467,10 +467,9 @@ public class MexcTradeService {
             }
         }
 
-        // безопасность: не выходим за бюджет (после коррекций)
+        // безопасность: не выходим за бюджет
         if (cost.compareTo(usdtAmount) > 0) {
             qty = normalizeQty(usdtAmount.divide(normPrice, 18, RoundingMode.DOWN), f);
-            // снова учесть ограничение maxQty
             if (maxQty != null && maxQty.signum() > 0) {
                 BigDecimal maxNorm = normalizeQty(maxQty, f);
                 if (qty.compareTo(maxNorm) > 0) qty = maxNorm;
@@ -506,12 +505,11 @@ public class MexcTradeService {
         } catch (RuntimeException ex) {
             String msg = ex.getMessage() == null ? "" : ex.getMessage();
             if (msg.contains("\"code\":30087")) {
-                // поднимем цену к безопасной (ещё на epsilonTicks выше)
                 BigDecimal bumped = guardBuyPrice(symbol, normPrice.add(f.tickSize.multiply(BigDecimal.valueOf(
                         appProperties.getDrain().getEpsilonTicks()
                 ))));
                 if (bumped.compareTo(normPrice) > 0) {
-                    log.warn("SELL {}: code=30087 — повышаю price {} -> {}", symbol, normPrice, bumped);
+                    log.warn("BUY {}: code=30087 — повышаю price {} -> {}", symbol, normPrice, bumped);
                     params.put("price", bumped.toPlainString());
                     resp = signedRequest("POST", ORDER_ENDPOINT, params, creds.getApiKey(), creds.getSecret());
                 } else {
@@ -521,6 +519,7 @@ public class MexcTradeService {
                 throw ex;
             }
         }
+
         String orderId = (resp != null && resp.has("orderId")) ? resp.get("orderId").asText() : null;
 
         log.info("📤 BUY {} размещён: orderId={}, price={}, qty={}, cost~{}",
@@ -529,6 +528,7 @@ public class MexcTradeService {
         if (orderId == null) log.warn("placeLimitBuyAccountA unexpected response: {}", resp);
         return orderId;
     }
+
 
     // === Планирование MARKET SELL B без отправки — чтобы согласовать с BUY A
     public BigDecimal planMarketSellQtyAccountB(String symbol, BigDecimal price, BigDecimal requestedQty, Long chatId) {
@@ -1022,134 +1022,111 @@ public class MexcTradeService {
 // MexcTradeService.java (внутри класса)
 
     public RequoteResult ensureTopAskOrRequoteSell(
-            String symbol,
-            Long chatId,
-            String currentOrderId,
-            BigDecimal currentPrice,
-            BigDecimal qty,                // сколько продаём
-            int maxRequotes,
-            int epsilonTicks,
-            int depthLimit,
-            int postPlaceGraceMs
+            String symbol, Long chatId,
+            String currentOrderId, BigDecimal currentPrice, BigDecimal qty,
+            int maxRequotes, int epsilonTicks, int depthLimit, int postPlaceGraceMs
     ) {
         var credsA = MemoryDb.getAccountA(chatId);
-        if (credsA == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
+        if (credsA == null) throw new IllegalArgumentException("Нет ключей для accountA");
 
         String orderId = currentOrderId;
         BigDecimal price = currentPrice;
 
-        for (int i = 0; i <= maxRequotes; i++) {
+        for (int i = 0; i <= maxRequotes; ) {
             try { Thread.sleep(Math.max(0, postPlaceGraceMs)); } catch (InterruptedException ignored) {}
 
-            TopOfBook ex  = topExcludingSelf(symbol, chatId, depthLimit); // чужой лучший ask
-            TopOfBook inc = topIncludingSelf(symbol);                     // общий лучший ask
+            TopOfBook ex  = topExcludingSelf(symbol, chatId, depthLimit); // чужой топ
+            TopOfBook inc = topIncludingSelf(symbol);                      // общий топ (только для логов)
 
-            int dEx  = ticksBetween(symbol, price, ex.ask());
-            int dInc = ticksBetween(symbol, price, inc.ask());
-
-            // ✔ корректное условие: мы топ-ask, если НАША цена <= чужого ask
+            // мы топ-ask, если НАША цена <= чужого ask
             boolean weAreTopByLogic = price.compareTo(ex.ask()) <= 0;
-            boolean bookSeesUs      = dInc <= Math.max(1, epsilonTicks);
 
-            String verdict = weAreTopByLogic && bookSeesUs ? "OK" :
-                    (!weAreTopByLogic ? "FRONT_RUN" : "BOOK_LAG");
-
-            log.info("[REQUOTE-CHECK] leg=A-SELL try={}/{} price={} ex.ask={} inc.ask={} dEx={}ticks dInc={}ticks eps={} verdict={}",
-                    i, maxRequotes,
-                    price.stripTrailingZeros(),
-                    ex.ask().stripTrailingZeros(), inc.ask().stripTrailingZeros(),
-                    dEx, dInc, epsilonTicks, verdict);
-
-            if ("OK".equals(verdict)) {
+            if (weAreTopByLogic) {
+                log.info("[REQUOTE-CHECK] A-SELL OK by ex-self | price={} ex.ask={} inc.ask={}",
+                        price.stripTrailingZeros(), ex.ask().stripTrailingZeros(), inc.ask().stripTrailingZeros());
                 return new RequoteResult(true, "OK", orderId, price, ex, inc, i);
             }
 
+            // FRONT_RUN — нас подрезали. Переставляемся.
             debugTop(symbol, chatId, depthLimit);
 
-            if (i == maxRequotes) {
-                return new RequoteResult(false, verdict, orderId, price, ex, inc, i);
+            // на всякий случай мгновенно проверим, не FILLED ли уже
+            var st = waitUntilFilled(symbol, orderId, credsA.getApiKey(), credsA.getSecret(), 0);
+            if ("FILLED".equals(st.status())) {
+                log.warn("ensureTop[A-SELL]: ордер {} уже FILLED — перестановка не нужна", orderId);
+                return new RequoteResult(true, "ALREADY_FILLED", orderId, price, ex, inc, i);
             }
 
-            // Перестановка: снять старый и поставить новый возле нижней кромки спреда
             tryCancelOrder(symbol, orderId, credsA.getApiKey(), credsA.getSecret());
-
-            BigDecimal newPrice = getNearLowerSpreadPrice(symbol); // уже ex-self + align внутри
-            String newOrderId = placeLimitSellAccountA(symbol, newPrice, qty, chatId);
+            BigDecimal newPrice = getNearLowerSpreadPrice(symbol, chatId, depthLimit);
+            String newOrderId   = placeLimitSellAccountA(symbol, newPrice, qty, chatId);
 
             log.warn("🔁 REQUOTE A-SELL: {} -> {} (orderId={} -> {})",
                     price.stripTrailingZeros(), newPrice.stripTrailingZeros(), orderId, newOrderId);
 
             orderId = newOrderId;
             price   = newPrice;
+            i++; // считаем только реальные перестановки
         }
-        return new RequoteResult(false, "UNKNOWN", orderId, price, null, null, maxRequotes);
+        return new RequoteResult(false, "LIMIT_REACHED", currentOrderId, currentPrice, null, null, maxRequotes);
     }
+
+
+
 // MexcTradeService.java (внутри класса)
 
     public RequoteResult ensureTopBidOrRequoteBuy(
-            String symbol,
-            Long chatId,
-            String currentOrderId,
-            BigDecimal currentPrice,
-            BigDecimal usdtAmount,         // бюджет лимитки A-BUY
-            BigDecimal maxQty,             // верхняя граница по qty (для согласования с B-SELL)
-            int maxRequotes,
-            int epsilonTicks,
-            int depthLimit,
-            int postPlaceGraceMs
+            String symbol, Long chatId,
+            String currentOrderId, BigDecimal currentPrice,
+            BigDecimal usdtAmount, BigDecimal maxQty,
+            int maxRequotes, int epsilonTicks, int depthLimit, int postPlaceGraceMs
     ) {
         var credsA = MemoryDb.getAccountA(chatId);
-        if (credsA == null) throw new IllegalArgumentException("Нет ключей для accountA (chatId=" + chatId + ")");
+        if (credsA == null) throw new IllegalArgumentException("Нет ключей для accountA");
 
         String orderId = currentOrderId;
         BigDecimal price = currentPrice;
 
-        for (int i = 0; i <= maxRequotes; i++) {
+        for (int i = 0; i <= maxRequotes; ) {
             try { Thread.sleep(Math.max(0, postPlaceGraceMs)); } catch (InterruptedException ignored) {}
 
-            TopOfBook ex  = topExcludingSelf(symbol, chatId, depthLimit); // чужой лучший bid
-            TopOfBook inc = topIncludingSelf(symbol);                     // общий лучший bid
+            TopOfBook ex  = topExcludingSelf(symbol, chatId, depthLimit);
+            TopOfBook inc = topIncludingSelf(symbol);
 
-            int dEx  = ticksBetween(symbol, price, ex.bid());
-            int dInc = ticksBetween(symbol, price, inc.bid());
-
-            // ✔ корректное условие: мы топ-bid, если НАША цена >= чужого bid
+            // мы топ-bid, если НАША цена >= чужого bid
             boolean weAreTopByLogic = price.compareTo(ex.bid()) >= 0;
-            boolean bookSeesUs      = dInc <= Math.max(1, epsilonTicks);
 
-            String verdict = weAreTopByLogic && bookSeesUs ? "OK" :
-                    (!weAreTopByLogic ? "FRONT_RUN" : "BOOK_LAG");
-
-            log.info("[REQUOTE-CHECK] leg=A-BUY  try={}/{} price={} ex.bid={} inc.bid={} dEx={}ticks dInc={}ticks eps={} verdict={}",
-                    i, maxRequotes,
-                    price.stripTrailingZeros(),
-                    ex.bid().stripTrailingZeros(), inc.bid().stripTrailingZeros(),
-                    dEx, dInc, epsilonTicks, verdict);
-
-            if ("OK".equals(verdict)) {
+            if (weAreTopByLogic) {
+                log.info("[REQUOTE-CHECK] A-BUY OK by ex-self | price={} ex.bid={} inc.bid={}",
+                        price.stripTrailingZeros(), ex.bid().stripTrailingZeros(), inc.bid().stripTrailingZeros());
                 return new RequoteResult(true, "OK", orderId, price, ex, inc, i);
             }
 
+            // FRONT_RUN — переставляемся
             debugTop(symbol, chatId, depthLimit);
 
-            if (i == maxRequotes) {
-                return new RequoteResult(false, verdict, orderId, price, ex, inc, i);
+            var st = waitUntilFilled(symbol, orderId, credsA.getApiKey(), credsA.getSecret(), 0);
+            if ("FILLED".equals(st.status())) {
+                log.warn("ensureTop[A-BUY ]: ордер {} уже FILLED — перестановка не нужна", orderId);
+                return new RequoteResult(true, "ALREADY_FILLED", orderId, price, ex, inc, i);
             }
 
-            // Перестановка BUY: снять старый и поставить новый возле верхней кромки спреда
             tryCancelOrder(symbol, orderId, credsA.getApiKey(), credsA.getSecret());
-
-            BigDecimal newPrice = getNearUpperSpreadPrice(symbol); // внутри — ex-self + align
-            String newOrderId = placeLimitBuyAccountA(symbol, newPrice, usdtAmount, maxQty, chatId);
+            BigDecimal newPrice = getNearUpperSpreadPrice(symbol, chatId, depthLimit);
+            String newOrderId   = placeLimitBuyAccountA(symbol, newPrice, usdtAmount, maxQty, chatId);
 
             log.warn("🔁 REQUOTE A-BUY : {} -> {} (orderId={} -> {})",
                     price.stripTrailingZeros(), newPrice.stripTrailingZeros(), orderId, newOrderId);
 
             orderId = newOrderId;
             price   = newPrice;
+            i++;
         }
-        return new RequoteResult(false, "UNKNOWN", orderId, price, null, null, maxRequotes);
+        return new RequoteResult(false, "LIMIT_REACHED", currentOrderId, currentPrice, null, null, maxRequotes);
     }
+
+
+
 
     // --- Открытые ордера аккаунта A по символу
     public List<OpenOrder> getOpenOrdersAccountA(String symbol, Long chatId) {
@@ -1364,7 +1341,7 @@ public class MexcTradeService {
         }
         BigDecimal spread = top.ask().subtract(top.bid());
         if (spread.signum() < 0) spread = BigDecimal.ZERO;
-        BigDecimal raw = top.bid().add(spread.multiply(new BigDecimal("0.10")));
+        BigDecimal raw = top.bid().add(spread.multiply(new BigDecimal("0.01")));
         BigDecimal price = alignPriceCeil(symbol, raw);
         log.info("getNearLowerSpreadPrice(ex-self)[{}]: bid={} ask={} -> {}", symbol,
                 top.bid().stripTrailingZeros(), top.ask().stripTrailingZeros(), price.stripTrailingZeros());
@@ -1379,7 +1356,7 @@ public class MexcTradeService {
         }
         BigDecimal spread = top.ask().subtract(top.bid());
         if (spread.signum() < 0) spread = BigDecimal.ZERO;
-        BigDecimal raw = top.ask().subtract(spread.multiply(new BigDecimal("0.10")));
+        BigDecimal raw = top.ask().subtract(spread.multiply(new BigDecimal("0.01")));
         BigDecimal price = alignPriceFloor(symbol, raw);
         log.info("getNearUpperSpreadPrice(ex-self)[{}]: bid={} ask={} -> {}", symbol,
                 top.bid().stripTrailingZeros(), top.ask().stripTrailingZeros(), price.stripTrailingZeros());

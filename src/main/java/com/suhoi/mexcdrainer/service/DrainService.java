@@ -84,6 +84,7 @@ public class DrainService {
             String sellOrderId = mexcTradeService.placeLimitSellAccountA(symbol, sellPrice, s.getQtyA(), chatId);
             s.setSellOrderId(sellOrderId);
             s.setState(DrainSession.State.A_SELL_PLACED);
+
             var cfg = props.getDrain();
             var rqSell = mexcTradeService.ensureTopAskOrRequoteSell(
                     symbol, chatId,
@@ -95,20 +96,15 @@ public class DrainService {
             );
             if (!rqSell.ok()) {
                 s.setState(DrainSession.State.AUTO_PAUSE);
-                // тут твой tgNotifyAutoPause(...) — можно вложить rqSell.reason()/ex/inc в сообщение
                 return BigDecimal.ZERO;
             }
             s.setSellOrderId(rqSell.orderId());
             s.setPSell(rqSell.price());
-            log.info("A ➡ SELL лимитка {} токенов @ {} (orderId={})",
-                    s.getQtyA().stripTrailingZeros(), sellPrice.stripTrailingZeros(), sellOrderId);
 
-            var vBuyPlaced = reconciler.checkAfterBuyPlaced(symbol, chatId, s);
-            if (vBuyPlaced != Reconciler.Verdict.OK) {
-                s.autoPause(DrainSession.AutoPauseReason.FRONT_RUN,
-                        "После A-BUY наш bid не топ (верификация).");
-                return BigDecimal.ZERO;
-            }
+            log.info("A ➡ SELL лимитка {} токенов @ {} (orderId={})",
+                    s.getQtyA().stripTrailingZeros(),
+                    s.getPSell().stripTrailingZeros(),
+                    s.getSellOrderId());
 
             // === B MARKET BUY (вернём фактически потраченный quote)
             BigDecimal spent = mexcTradeService.marketBuyFromAccountB(symbol, s.getPSell(), s.getQtyA(), chatId, true);
@@ -116,7 +112,7 @@ public class DrainService {
             s.setState(DrainSession.State.B_MKT_BUY_SENT);
             log.info("B ➡ BUY market на ~{} USDT", spent == null ? "0" : spent.stripTrailingZeros().toPlainString());
 
-            // Быстрая сверка факта на B (появилась база?)
+            // Быстрая сверка факта на B
             var vBuy = reconciler.checkAfterBBuy(symbol, chatId, s);
             if (vBuy != Reconciler.Verdict.OK) {
                 s.autoPause(DrainSession.AutoPauseReason.PARTIAL_MISMATCH, "После MARKET BUY на B база отсутствует.");
@@ -138,7 +134,7 @@ public class DrainService {
                     symbol, chatId, props.getDrain().getDepthLimit());
             s.setPBuy(buyPrice);
 
-            // Планирование кол-ва под MARKET SELL B оставляем как было:
+            // Планирование количества под MARKET SELL B
             BigDecimal plannedSellQtyB = mexcTradeService.planMarketSellQtyAccountB(symbol, buyPrice, s.getQtyA(), chatId);
             if (plannedSellQtyB.compareTo(BigDecimal.ZERO) <= 0) {
                 s.autoPause(DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE, "B не может выставить MARKET SELL ≥ minNotional.");
@@ -152,33 +148,37 @@ public class DrainService {
             String buyOrderId = mexcTradeService.placeLimitBuyAccountA(symbol, buyPrice, spendA, plannedSellQtyB, chatId);
             s.setBuyOrderId(buyOrderId);
             s.setState(DrainSession.State.A_BUY_PLACED);
-            log.info("A ➡ BUY лимитка {} USDT @ {} (maxQty={} ; orderId={})",
-                    spendA.stripTrailingZeros(), buyPrice.stripTrailingZeros(),
-                    plannedSellQtyB.stripTrailingZeros(), buyOrderId);
-            cfg = props.getDrain();
+
             var rqBuy = mexcTradeService.ensureTopBidOrRequoteBuy(
                     symbol, chatId,
                     s.getBuyOrderId(), s.getPBuy(),
-                    spendA, plannedSellQtyB,                 // важно: те же бюджет и maxQty
+                    spendA, plannedSellQtyB,
                     cfg.getMaxRequotesPerLeg(),
                     cfg.getEpsilonTicks(),
                     cfg.getDepthLimit(),
                     cfg.getPostPlaceGraceMs()
             );
-
             if (!rqBuy.ok()) {
                 s.setState(DrainSession.State.AUTO_PAUSE);
-                // tgNotifyAutoPause(...) с деталями rqBuy
                 return BigDecimal.ZERO;
             }
             s.setBuyOrderId(rqBuy.orderId());
             s.setPBuy(rqBuy.price());
-            var vSellPlaced = reconciler.checkAfterSellPlaced(symbol, chatId, s);
-            if (vSellPlaced != Reconciler.Verdict.OK) {
+
+            log.info("A ➡ BUY лимитка {} USDT @ {} (maxQty={} ; orderId={})",
+                    spendA.stripTrailingZeros(),
+                    s.getPBuy().stripTrailingZeros(),
+                    plannedSellQtyB.stripTrailingZeros(),
+                    s.getBuyOrderId());
+
+            // ПРАВИЛЬНАЯ проверка после BUY
+            var vBuyPlaced = reconciler.checkAfterBuyPlaced(symbol, chatId, s);
+            if (vBuyPlaced != Reconciler.Verdict.OK) {
                 s.autoPause(DrainSession.AutoPauseReason.FRONT_RUN,
-                        "После A-SELL наша цена не топ ask (верификация).");
+                        "После A-BUY наш bid не топ (верификация).");
                 return BigDecimal.ZERO;
             }
+
             // === B MARKET SELL
             mexcTradeService.marketSellFromAccountB(symbol, buyPrice, plannedSellQtyB, chatId);
             s.setState(DrainSession.State.B_MKT_SELL_SENT);
@@ -222,6 +222,7 @@ public class DrainService {
             return BigDecimal.ZERO;
         }
     }
+
 
     // Ручная пауза
     public void requestStop(Long chatId) {
