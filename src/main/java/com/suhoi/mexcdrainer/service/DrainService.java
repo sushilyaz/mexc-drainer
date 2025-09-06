@@ -17,7 +17,7 @@ public class DrainService {
     private static final boolean FAST_CROSS_IOC = true;      // быстрый выкуп через LIMIT IOC на B сразу после A-SELL
     private static final int FAST_ENSURE_GRACE_MS = 150;     // «быстрый» grace для ensure после неудачного IOC
     private static final int FAST_MAX_REQUOTES   = 1;        // максимум 1 перестановка в «быстром» сценарии
-    private static final int BOOK_GLUE_SLEEP_MS  = 80;       // микро-пауза чтобы книга «проклеилась» после A-SELL
+    private static final int BOOK_GLUE_SLEEP_MS  = 15;       // микро-пауза чтобы книга «проклеилась» после A-SELL
 
     private final MexcTradeService mexcTradeService;
     private final Reconciler reconciler;
@@ -285,7 +285,12 @@ public class DrainService {
 
             var placedBuy = mexcTradeService.placeLimitBuyAccountAPlaced(symbol, nearBuy, spendA, plannedSellQtyB, chatId);
             log.info("[BUY_PLACED] orderId={}, price={}, qty={} (requestedBudget={}, requestedMaxQty={})",
-                    placedBuy.orderId(), fmt(placedBuy.price()), fmt(placedBuy.qty()), fmt(spendA), fmt(plannedSellQtyB));
+                    placedBuy.orderId(),
+                    fmt(placedBuy.price()),
+                    fmt(placedBuy.qty()),     // ← было fmt(spendA)
+                    fmt(spendA),
+                    fmt(plannedSellQtyB));
+            ;
 
             if (placedBuy.orderId() == null || placedBuy.qty() == null || placedBuy.qty().signum() <= 0) {
                 return autoPauseAndZero(s,
@@ -295,7 +300,32 @@ public class DrainService {
             }
             s.setBuyOrderId(placedBuy.orderId());
             s.setPBuy(placedBuy.price());
-            plannedSellQtyB = placedBuy.qty(); // синхронизируем объём B SELL с фактическим BUY qty
+
+            // синхронизируем объём продажи B с фактическим qty BUY
+            plannedSellQtyB = placedBuy.qty();
+            s.setPlannedSellQtyB(plannedSellQtyB);
+            log.info("[BUY_PLACED_SYNC] orderId={}, price={}, plannedBsellQty={} (expected remainder on B ≈ {})",
+                    s.getBuyOrderId(), fmt(s.getPBuy()), fmt(plannedSellQtyB),
+                    fmt(s.getQtyA().subtract(plannedSellQtyB)));
+            // === (4a) FAST CROSS на продаже B: сразу LIMIT IOC SELL (эмуляция MARKET SELL)
+            boolean fastSellOk = false;
+            if (FAST_CROSS_IOC) {
+                try { Thread.sleep(BOOK_GLUE_SLEEP_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+
+                log.info("[B_SELL_SEND_FAST_IOC] limitSellBelowSpreadAccountB(symbol={}, qty={})",
+                        symbol, fmt(plannedSellQtyB));
+                mexcTradeService.limitSellBelowSpreadAccountB(symbol, plannedSellQtyB, chatId);
+                s.setState(DrainSession.State.B_MKT_SELL_SENT);
+                log.info("[B_SELL_FAST_IOC_SENT]");
+
+                // Проверяем, что база на B реально списалась
+                fastSellOk = (reconciler.checkAfterBSell(symbol, chatId, s) == Reconciler.Verdict.OK);
+                log.info("[B_SELL_FAST_POSTCHECK] ok={}", fastSellOk);
+            }
+
+            int ensureGrace = fastSellOk
+                    ? Math.min(FAST_ENSURE_GRACE_MS, cfg.getPostPlaceGraceMs())
+                    : cfg.getPostPlaceGraceMs();
 
             var rqBuy = mexcTradeService.ensureTopBidOrRequoteBuy(
                     symbol, chatId,
@@ -304,7 +334,7 @@ public class DrainService {
                     cfg.getMaxRequotesPerLeg(),
                     cfg.getEpsilonTicks(),
                     cfg.getDepthLimit(),
-                    cfg.getPostPlaceGraceMs()
+                    ensureGrace
             );
             if (!rqBuy.ok()) {
                 return autoPauseAndZero(s,
@@ -323,30 +353,47 @@ public class DrainService {
                     plannedSellQtyB.stripTrailingZeros(),
                     s.getBuyOrderId());
 
+            // быстрый sanity-check на подрезание
             var vBuyPlaced = reconciler.checkAfterBuyPlaced(symbol, chatId, s);
             log.info("[BUY_POSTCHECK] verdict={}", vBuyPlaced);
             if (vBuyPlaced != Reconciler.Verdict.OK) {
-                return autoPauseAndZero(s,
-                        DrainSession.AutoPauseReason.FRONT_RUN,
-                        "После A-BUY наш bid не топ (верификация).",
-                        "A-BUY-VERIFY");
+                var rq2 = mexcTradeService.ensureTopBidOrRequoteBuy(
+                        symbol, chatId,
+                        s.getBuyOrderId(), s.getPBuy(),
+                        spendA, plannedSellQtyB,
+                        /*maxRequotes*/ 1,
+                        cfg.getEpsilonTicks(),
+                        cfg.getDepthLimit(),
+                        /*postPlaceGraceMs*/ 40
+                );
+                if (!rq2.ok()) {
+                    return autoPauseAndZero(s,
+                            DrainSession.AutoPauseReason.FRONT_RUN,
+                            "После A-BUY нас подрезали повторно.", "A-BUY-RECHECK");
+                }
+                s.setBuyOrderId(rq2.orderId());
+                s.setPBuy(rq2.price());
+                log.info("[BUY_RECHECK_OK] orderId={}, price={}", s.getBuyOrderId(), fmt(s.getPBuy()));
             }
 
-            // === (5) B MARKET SELL — под фактический BUY qty
-            log.info("[B_SELL_SEND] marketSellFromAccountB(symbol={}, pBuy={}, qty={})",
-                    symbol, fmt(s.getPBuy()), fmt(plannedSellQtyB));
-            mexcTradeService.marketSellFromAccountB(symbol, s.getPBuy(), plannedSellQtyB, chatId);
-            s.setState(DrainSession.State.B_MKT_SELL_SENT);
-            log.info("[B_SELL_SENT] ok");
+            // === (5) ФОЛБЭК: если быстрый крест на продаже B не подтвердился — продаём сейчас
+            if (!fastSellOk) {
+                log.info("[B_SELL_SEND] limitSellBelowSpreadAccountB(symbol={}, qty={})",
+                        symbol, fmt(plannedSellQtyB));
+                mexcTradeService.limitSellBelowSpreadAccountB(symbol, plannedSellQtyB, chatId);
+                s.setState(DrainSession.State.B_MKT_SELL_SENT);
+                log.info("[B_SELL_SENT] ok");
 
-            var vSellB = reconciler.checkAfterBSell(symbol, chatId, s);
-            log.info("[B_SELL_POSTCHECK] verdict={}", vSellB);
-            if (vSellB != Reconciler.Verdict.OK) {
-                return autoPauseAndZero(s,
-                        DrainSession.AutoPauseReason.PARTIAL_MISMATCH,
-                        "После MARKET SELL на B осталась не-пыль.",
-                        "B-SELL-VERIFY");
+                var vSellB = reconciler.checkAfterBSell(symbol, chatId, s);
+                log.info("[B_SELL_POSTCHECK] verdict={}", vSellB);
+                if (vSellB != Reconciler.Verdict.OK) {
+                    return autoPauseAndZero(s,
+                            DrainSession.AutoPauseReason.PARTIAL_MISMATCH,
+                            "После MARKET SELL на B осталась не-пыль.",
+                            "B-SELL-VERIFY");
+                }
             }
+
 
             // === (6) Ждём FILLED по A-BUY — это next qty
             var credsA2 = MemoryDb.getAccountA(chatId);
@@ -390,6 +437,7 @@ public class DrainService {
             return BigDecimal.ZERO;
         }
     }
+
 
     // Ручная пауза
     public void requestStop(Long chatId) {

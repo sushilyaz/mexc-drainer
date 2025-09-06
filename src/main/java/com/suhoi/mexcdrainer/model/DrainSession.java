@@ -45,6 +45,12 @@ public class DrainSession {
 
     public BigDecimal lastSpentB;     // сколько USDT реально списали с B при MARKET BUY
     public BigDecimal lastCummA;      // сколько USDT реально пришло на A при SELL
+    /**
+     * Сколько планируем продать с аккаунта B в текущем цикле —
+     * всегда равно фактическому количеству в лимитной заявке BUY на аккаунте A.
+     * Нужно для корректной сверки: остаток на B после продажи может быть НЕ пылью.
+     */
+    private BigDecimal plannedSellQtyB = BigDecimal.ZERO;
 
     // счётчики «перестановок» против вклинивания
     public int requotesSell = 0;

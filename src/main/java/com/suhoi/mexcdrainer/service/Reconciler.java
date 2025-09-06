@@ -88,14 +88,42 @@ public class Reconciler {
         return Verdict.AUTO_PAUSE;
     }
 
-    /** Проверка после MARKET SELL на B: на B должна остаться пыль, а A получить базовый актив. */
+    /** Проверка после MARKET/IOC SELL на B.
+     *  Раньше требовали «на B осталась пыль», что неверно, когда A-BUY не покрывает весь объём.
+     *  Теперь считаем ожидаемый остаток: qtyA(на входе цикла) - plannedSellQtyB.
+     *  Если фактический остаток на B <= ожидаемого + небольшой допуск — всё ок.
+     */
     public Verdict checkAfterBSell(String symbol, Long chatId, DrainSession s) {
         BigDecimal bBase = mexc.getTokenBalanceAccountB(symbol, chatId);
+        if (bBase == null) bBase = BigDecimal.ZERO;
+
         var f = mexc.getSymbolFilters(symbol);
-        BigDecimal step = f.stepSize;
-        BigDecimal dust = step.max(new BigDecimal("0.00000001"));
-        if (bBase.compareTo(dust) <= 0) return Verdict.OK; // пыль допустима
+        // Шаг количества — наш базовый «пиксель», также считаем «пылью».
+        BigDecimal step = (f != null && f.stepSize != null && f.stepSize.signum() > 0)
+                ? f.stepSize
+                : new BigDecimal("0.00000001");
+
+        // Ожидаемый остаток: что было на входе цикла на A (qtyA) минус сколько A реально хочет купить (plannedSellQtyB).
+        BigDecimal expected = BigDecimal.ZERO;
+        if (s.getQtyA() != null && s.getPlannedSellQtyB() != null) {
+            expected = s.getQtyA().subtract(s.getPlannedSellQtyB());
+            if (expected.signum() < 0) expected = BigDecimal.ZERO;
+        }
+
+        // Допуск: три шага количества + «пыль».
+        BigDecimal tolerance = step.multiply(new BigDecimal("3"));
+        BigDecimal limit = expected.add(tolerance).max(step);
+
+        if (bBase.compareTo(limit) <= 0) {
+            return Verdict.OK;
+        }
+
+        log.warn("После B-SELL остаток на B больше ожидаемого: actual={} > limit(=expected {} + tol {})",
+                bBase.stripTrailingZeros().toPlainString(),
+                expected.stripTrailingZeros().toPlainString(),
+                tolerance.stripTrailingZeros().toPlainString());
         return Verdict.AUTO_PAUSE;
     }
+
 }
 
