@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 
 @Service
 @Slf4j
@@ -16,8 +17,8 @@ public class DrainService {
 
     private static final boolean FAST_CROSS_IOC = true;      // быстрый выкуп через LIMIT IOC на B сразу после A-SELL
     private static final int FAST_ENSURE_GRACE_MS = 150;     // «быстрый» grace для ensure после неудачного IOC
-    private static final int FAST_MAX_REQUOTES   = 1;        // максимум 1 перестановка в «быстром» сценарии
-    private static final int BOOK_GLUE_SLEEP_MS  = 15;       // микро-пауза чтобы книга «проклеилась» после A-SELL
+    private static final int FAST_MAX_REQUOTES = 1;        // максимум 1 перестановка в «быстром» сценарии
+    private static final int BOOK_GLUE_SLEEP_MS = 15;       // микро-пауза чтобы книга «проклеилась» после A-SELL
 
     private final MexcTradeService mexcTradeService;
     private final Reconciler reconciler;
@@ -49,7 +50,9 @@ public class DrainService {
                 .toString();
     }
 
-    /** Унифицированная автопауза + подробный лог в консоль. */
+    /**
+     * Унифицированная автопауза + подробный лог в консоль.
+     */
     private BigDecimal autoPauseAndZero(DrainSession s,
                                         DrainSession.AutoPauseReason reason,
                                         String details,
@@ -94,9 +97,12 @@ public class DrainService {
             tg.reply(chatId, "✅ A купил ~%s токенов @avg=%s".formatted(
                     s.getQtyA().stripTrailingZeros(), buyA.avgPrice().stripTrailingZeros()));
 
-            for (int i = 0; i < cycles; i++) {
-                s.setCycleIndex(i + 1);
+            int i = 0;
+            boolean unlimited = (cycles <= 0);
+            while (unlimited || i < cycles) {
+                s.setCycleIndex(++i);
                 log.info("===== CYCLE_START #{} {}", s.getCycleIndex(), snapshot(s));
+
                 BigDecimal next = executeCycleWithGuards(chatId, s);
                 log.info("===== CYCLE_END   #{} -> nextQtyA={} {}", s.getCycleIndex(), fmt(next), snapshot(s));
 
@@ -110,6 +116,12 @@ public class DrainService {
                 }
                 s.setQtyA(next);
             }
+            var sEnd = MemoryDb.getSession(chatId);
+            if (sEnd != null && !(sEnd.getState() == DrainSession.State.AUTO_PAUSE
+                    && sEnd.getReason() == DrainSession.AutoPauseReason.MANUAL)) {
+                finalSweepSellIfPossible(chatId, symbol);
+            }
+
 
         } catch (Exception e) {
             log.error("❌ Ошибка в startDrain", e);
@@ -127,8 +139,22 @@ public class DrainService {
             var cfg = props.getDrain();
 
             // === (1) A SELL — рядом с нижней кромкой
+            var f = mexcTradeService.getSymbolFilters(symbol);
+
             BigDecimal nearSell = mexcTradeService.getNearLowerSpreadPrice(symbol, chatId, cfg.getDepthLimit());
+            BigDecimal minQtyForSell = minQtyForNotional(nearSell, f);
+
+            if (s.getQtyA() == null || s.getQtyA().compareTo(minQtyForSell) < 0) {
+                return autoPauseAndZero(
+                        s,
+                        DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
+                        "qtyA < minQtyForNotional для SELL @ " + fmt(nearSell) + " (qtyA=" + fmt(s.getQtyA()) + ", min=" + fmt(minQtyForSell) + ")",
+                        "PRE-A-SELL-MIN"
+                );
+            }
+
             log.info("[SELL_PLANNED] nearSell={}, planQtyA={}", fmt(nearSell), fmt(s.getQtyA()));
+
 
             var placedSell = mexcTradeService.placeLimitSellAccountAPlaced(symbol, nearSell, s.getQtyA(), chatId);
             log.info("[SELL_PLACED] orderId={}, price={}, qty={}",
@@ -283,6 +309,16 @@ public class DrainService {
             log.info("[BUY_BUDGET] spendA={}, capByQty={}, plannedSellQtyB={}",
                     fmt(spendA), fmt(capByQty), fmt(plannedSellQtyB));
 
+            // стоп-условие: если бюджет A для BUY меньше minNotional — дальше крутить цикл бессмысленно
+            if (f != null && f.minNotional != null && f.minNotional.signum() > 0 && spendA.compareTo(f.minNotional) < 0) {
+                return autoPauseAndZero(
+                        s,
+                        DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
+                        "spendA < minNotional для BUY (spendA=" + fmt(spendA) + ", minNotional=" + fmt(f.minNotional) + ")",
+                        "PRE-A-BUY-MIN"
+                );
+            }
+
             var placedBuy = mexcTradeService.placeLimitBuyAccountAPlaced(symbol, nearBuy, spendA, plannedSellQtyB, chatId);
             log.info("[BUY_PLACED] orderId={}, price={}, qty={} (requestedBudget={}, requestedMaxQty={})",
                     placedBuy.orderId(),
@@ -311,7 +347,11 @@ public class DrainService {
             // === (4a) FAST CROSS на продаже B: сразу LIMIT IOC SELL (эмуляция MARKET SELL)
             boolean fastSellOk = false;
             if (FAST_CROSS_IOC) {
-                try { Thread.sleep(BOOK_GLUE_SLEEP_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                try {
+                    Thread.sleep(BOOK_GLUE_SLEEP_MS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
 
                 log.info("[B_SELL_SEND_FAST_IOC] limitSellBelowSpreadAccountB(symbol={}, qty={})",
                         symbol, fmt(plannedSellQtyB));
@@ -487,8 +527,10 @@ public class DrainService {
             MemoryDb.setSession(chatId, s);
             log.info("CONTINUE_SESSION_INIT {}", snapshot(s));
 
-            for (int i = 0; i < cycles; i++) {
-                s.setCycleIndex(i + 1);
+            int i = 0;
+            boolean unlimited = (cycles <= 0);
+            while (unlimited || i < cycles) {
+                s.setCycleIndex(++i);
                 log.info("===== CYCLE_START #{} {}", s.getCycleIndex(), snapshot(s));
                 BigDecimal next = executeCycleWithGuards(chatId, s);
                 log.info("===== CYCLE_END   #{} -> nextQtyA={} {}", s.getCycleIndex(), fmt(next), snapshot(s));
@@ -514,4 +556,55 @@ public class DrainService {
                 s.getPSell(), s.getPBuy(),
                 s.getReason(), s.getReasonDetails());
     }
+    // внутри DrainService (рядом с helper fmt(..))
+
+    /**
+     * Минимальное кол-во base, чтобы ордер прошёл minNotional на заданной цене, учитывая stepSize и minQty.
+     */
+    private BigDecimal minQtyForNotional(BigDecimal price, MexcTradeService.SymbolFilters f) {
+        if (f == null) return BigDecimal.ZERO;
+        BigDecimal minQty = (f.minQty != null) ? f.minQty : BigDecimal.ZERO;
+
+        // если у тикера нет minNotional, достаточно minQty
+        if (f.minNotional == null || f.minNotional.signum() <= 0 || price == null || price.signum() <= 0) {
+            return minQty;
+        }
+
+        BigDecimal raw = f.minNotional.divide(price, 16, RoundingMode.UP); // сколько штук нужно при этой цене
+        if (f.stepSize != null && f.stepSize.signum() > 0) {
+            BigDecimal steps = raw.divide(f.stepSize, 0, RoundingMode.UP);
+            return steps.multiply(f.stepSize).max(minQty);
+        }
+        return raw.max(minQty);
+    }
+
+    /**
+     * Финальный свип: если остаток на A проходит minNotional/minQty — сливаем MARKET SELL.
+     */
+    private void finalSweepSellIfPossible(Long chatId, String symbol) {
+        try {
+            var f = mexcTradeService.getSymbolFilters(symbol);
+            BigDecimal qtyA = mexcTradeService.getTokenBalanceAccountA(symbol, chatId);
+            if (qtyA == null || qtyA.signum() <= 0) {
+                log.info("FINAL_SWEEP_SKIP: пусто на A");
+                return;
+            }
+
+            // Оценим по nearLowerSpread, пройдём ли minNotional
+            BigDecimal nearSell = mexcTradeService.getNearLowerSpreadPrice(symbol, chatId, props.getDrain().getDepthLimit());
+            BigDecimal minQtyForSell = minQtyForNotional(nearSell, f);
+
+            if (qtyA.compareTo(minQtyForSell) >= 0) {
+                log.info("FINAL_SWEEP_SELL: qtyA={} >= minQtyForSell={} -> MARKET SELL", fmt(qtyA), fmt(minQtyForSell));
+                mexcTradeService.forceMarketSellAccountA(symbol, qtyA, chatId);
+                tg.reply(chatId, "🧹 Финальный SELL: продал остаток %s %s".formatted(
+                        qtyA.stripTrailingZeros().toPlainString(), symbol.replace("USDT", "")));
+            } else {
+                log.info("FINAL_SWEEP_SKIP: qtyA={} < minQtyForSell={} (пыль, оставляем).", fmt(qtyA), fmt(minQtyForSell));
+            }
+        } catch (Exception e) {
+            log.error("FINAL_SWEEP_ERROR: {}", e.getMessage(), e);
+        }
+    }
+
 }
