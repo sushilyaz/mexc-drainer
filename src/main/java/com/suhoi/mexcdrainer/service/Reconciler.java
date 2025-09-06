@@ -94,36 +94,39 @@ public class Reconciler {
      *  Если фактический остаток на B <= ожидаемого + небольшой допуск — всё ок.
      */
     public Verdict checkAfterBSell(String symbol, Long chatId, DrainSession s) {
-        BigDecimal bBase = mexc.getTokenBalanceAccountB(symbol, chatId);
-        if (bBase == null) bBase = BigDecimal.ZERO;
+        BigDecimal bNow = mexc.getTokenBalanceAccountB(symbol, chatId);
+        if (bNow == null) bNow = BigDecimal.ZERO;
 
         var f = mexc.getSymbolFilters(symbol);
-        // Шаг количества — наш базовый «пиксель», также считаем «пылью».
         BigDecimal step = (f != null && f.stepSize != null && f.stepSize.signum() > 0)
                 ? f.stepSize
-                : new BigDecimal("0.00000001");
+                : new BigDecimal("1"); // минимальный безопасный шаг в штуках токена, если вдруг нет фильтров
 
-        // Ожидаемый остаток: что было на входе цикла на A (qtyA) минус сколько A реально хочет купить (plannedSellQtyB).
-        BigDecimal expected = BigDecimal.ZERO;
-        if (s.getQtyA() != null && s.getPlannedSellQtyB() != null) {
-            expected = s.getQtyA().subtract(s.getPlannedSellQtyB());
-            if (expected.signum() < 0) expected = BigDecimal.ZERO;
-        }
+        // База B перед SELL с учётом хвостов прошлых циклов.
+        BigDecimal bBefore = (s.getBBaseBeforeSell() != null) ? s.getBBaseBeforeSell() : BigDecimal.ZERO;
+        BigDecimal planned = (s.getPlannedSellQtyB() != null) ? s.getPlannedSellQtyB() : BigDecimal.ZERO;
 
-        // Допуск: три шага количества + «пыль».
+        // Ожидаемый остаток: что было на B перед продажей минус план продаж.
+        BigDecimal expected = bBefore.subtract(planned);
+        if (expected.signum() < 0) expected = BigDecimal.ZERO;
+
+        // Допуск — пару-тройку шагов количества.
         BigDecimal tolerance = step.multiply(new BigDecimal("3"));
         BigDecimal limit = expected.add(tolerance).max(step);
 
-        if (bBase.compareTo(limit) <= 0) {
+        if (bNow.compareTo(limit) <= 0) {
             return Verdict.OK;
         }
 
-        log.warn("После B-SELL остаток на B больше ожидаемого: actual={} > limit(=expected {} + tol {})",
-                bBase.stripTrailingZeros().toPlainString(),
+        log.warn("После B-SELL остаток на B больше ожидаемого: actual={} > limit(=expected {} + tol {}) [bBefore={}, plannedSellQtyB={}]",
+                bNow.stripTrailingZeros().toPlainString(),
                 expected.stripTrailingZeros().toPlainString(),
-                tolerance.stripTrailingZeros().toPlainString());
+                tolerance.stripTrailingZeros().toPlainString(),
+                bBefore.stripTrailingZeros().toPlainString(),
+                planned.stripTrailingZeros().toPlainString());
         return Verdict.AUTO_PAUSE;
     }
+
 
 }
 

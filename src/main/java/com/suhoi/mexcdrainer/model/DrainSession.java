@@ -39,6 +39,7 @@ public class DrainSession {
     public BigDecimal qtyA;           // «рабочее» кол-во базового на A на входе цикла
     public String sellOrderId;
     public String buyOrderId;
+    private BigDecimal bBaseBeforeSell = BigDecimal.ZERO;
 
     public BigDecimal pSell;          // выставленная цена SELL (нижняя кромка)
     public BigDecimal pBuy;           // выставленная цена BUY  (верхняя кромка)

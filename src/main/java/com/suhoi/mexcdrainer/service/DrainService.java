@@ -308,12 +308,20 @@ public class DrainService {
                     s.getBuyOrderId(), fmt(s.getPBuy()), fmt(plannedSellQtyB),
                     fmt(s.getQtyA().subtract(plannedSellQtyB)));
             // === (4a) FAST CROSS на продаже B: сразу LIMIT IOC SELL (эмуляция MARKET SELL)
+            // === (4a) FAST CROSS на продаже B: сразу LIMIT IOC SELL (эмуляция MARKET SELL)
             boolean fastSellOk = false;
             if (FAST_CROSS_IOC) {
                 try { Thread.sleep(BOOK_GLUE_SLEEP_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
 
                 log.info("[B_SELL_SEND_FAST_IOC] limitSellBelowSpreadAccountB(symbol={}, qty={})",
                         symbol, fmt(plannedSellQtyB));
+
+                // ⬇️ NEW: снимок базы на B перед продажей текущего цикла (включает хвосты прошлых циклов)
+                s.setBBaseBeforeSell(mexcTradeService.getTokenBalanceAccountB(symbol, chatId));
+                log.info("[B_SELL_PRECHECK] bBaseBeforeSell={} (will sell={})",
+                        fmt(s.getBBaseBeforeSell()), fmt(plannedSellQtyB));
+                // ⬆️ NEW
+
                 mexcTradeService.limitSellBelowSpreadAccountB(symbol, plannedSellQtyB, chatId);
                 s.setState(DrainSession.State.B_MKT_SELL_SENT);
                 log.info("[B_SELL_FAST_IOC_SENT]");
@@ -322,6 +330,7 @@ public class DrainService {
                 fastSellOk = (reconciler.checkAfterBSell(symbol, chatId, s) == Reconciler.Verdict.OK);
                 log.info("[B_SELL_FAST_POSTCHECK] ok={}", fastSellOk);
             }
+
 
             int ensureGrace = fastSellOk
                     ? Math.min(FAST_ENSURE_GRACE_MS, cfg.getPostPlaceGraceMs())
@@ -377,9 +386,17 @@ public class DrainService {
             }
 
             // === (5) ФОЛБЭК: если быстрый крест на продаже B не подтвердился — продаём сейчас
+// === (5) ФОЛБЭК: если быстрый крест на продаже B не подтвердился — продаём сейчас
             if (!fastSellOk) {
                 log.info("[B_SELL_SEND] limitSellBelowSpreadAccountB(symbol={}, qty={})",
                         symbol, fmt(plannedSellQtyB));
+
+                // ⬇️ NEW: повторно фиксируем снимок базы на B именно перед фактической продажей
+                s.setBBaseBeforeSell(mexcTradeService.getTokenBalanceAccountB(symbol, chatId));
+                log.info("[B_SELL_PRECHECK_FALLBACK] bBaseBeforeSell={} (will sell={})",
+                        fmt(s.getBBaseBeforeSell()), fmt(plannedSellQtyB));
+                // ⬆️ NEW
+
                 mexcTradeService.limitSellBelowSpreadAccountB(symbol, plannedSellQtyB, chatId);
                 s.setState(DrainSession.State.B_MKT_SELL_SENT);
                 log.info("[B_SELL_SENT] ok");
@@ -393,7 +410,6 @@ public class DrainService {
                             "B-SELL-VERIFY");
                 }
             }
-
 
             // === (6) Ждём FILLED по A-BUY — это next qty
             var credsA2 = MemoryDb.getAccountA(chatId);
