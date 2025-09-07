@@ -155,7 +155,6 @@ public class DrainService {
 
             log.info("[SELL_PLANNED] nearSell={}, planQtyA={}", fmt(nearSell), fmt(s.getQtyA()));
 
-
             var placedSell = mexcTradeService.placeLimitSellAccountAPlaced(symbol, nearSell, s.getQtyA(), chatId);
             log.info("[SELL_PLACED] orderId={}, price={}, qty={}",
                     placedSell.orderId(), fmt(placedSell.price()), fmt(placedSell.qty()));
@@ -173,26 +172,20 @@ public class DrainService {
 
             // === (1a) FAST PATH: сразу B LIMIT IOC BUY по нашему pSell/qtyA
             if (FAST_CROSS_IOC) {
-                try {
-                    Thread.sleep(BOOK_GLUE_SLEEP_MS); // небольшая задержка, чтобы книга увидела наш ask
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                }
+                try { Thread.sleep(BOOK_GLUE_SLEEP_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
 
                 log.info("[B_BUY_SEND_FAST_IOC] limitIocBuyFromAccountB(symbol={}, price={}, qty={})",
                         symbol, fmt(s.getPSell()), fmt(s.getQtyA()));
                 mexcTradeService.limitIocBuyFromAccountB(symbol, s.getPSell(), s.getQtyA(), chatId);
-                // для логов: приблизительно сколько «должно» было потратиться
                 s.setLastSpentB(s.getPSell().multiply(s.getQtyA()));
                 s.setState(DrainSession.State.B_MKT_BUY_SENT);
                 log.info("[B_BUY_FAST_IOC_SENT] approxSpent={} USDT", fmt(s.getLastSpentB()));
 
-                // Проверка: действительно ли база на B появилась (т.е. IOC снял наш ask)
                 var vBuyB_fast = reconciler.checkAfterBBuy(symbol, chatId, s);
                 log.info("[B_BUY_FAST_POSTCHECK] verdict={}", vBuyB_fast);
 
                 if (vBuyB_fast != Reconciler.Verdict.OK) {
-                    // 1b) Быстрый ensure (очень короткий) — подвинуть наш ask наверх, если надо
+                    // Быстрый ensure A-SELL
                     var rqSell = mexcTradeService.ensureTopAskOrRequoteSell(
                             symbol, chatId,
                             s.getSellOrderId(), s.getPSell(), s.getQtyA(),
@@ -212,7 +205,7 @@ public class DrainService {
                     log.info("[SELL_ENSURED_FAST] orderId={}, price={}, qty={}",
                             s.getSellOrderId(), fmt(s.getPSell()), fmt(s.getQtyA()));
 
-                    // если всё ещё не сняли — добиваем MARKET BUY (запасной старый путь)
+                    // Фолбэк: MARKET BUY на B
                     log.info("[B_BUY_SEND_FALLBACK_MKT] marketBuyFromAccountB(symbol={}, pSell={}, qtyA={})",
                             symbol, fmt(s.getPSell()), fmt(s.getQtyA()));
                     BigDecimal spent = mexcTradeService.marketBuyFromAccountB(symbol, s.getPSell(), s.getQtyA(), chatId, true);
@@ -230,7 +223,7 @@ public class DrainService {
                     }
                 }
             } else {
-                // === Медленный путь (как раньше): сначала ensure, затем MARKET BUY на B
+                // Медленный путь
                 var rqSell = mexcTradeService.ensureTopAskOrRequoteSell(
                         symbol, chatId,
                         s.getSellOrderId(), s.getPSell(), s.getQtyA(),
@@ -323,10 +316,9 @@ public class DrainService {
             log.info("[BUY_PLACED] orderId={}, price={}, qty={} (requestedBudget={}, requestedMaxQty={})",
                     placedBuy.orderId(),
                     fmt(placedBuy.price()),
-                    fmt(placedBuy.qty()),     // ← было fmt(spendA)
+                    fmt(placedBuy.qty()),
                     fmt(spendA),
                     fmt(plannedSellQtyB));
-            ;
 
             if (placedBuy.orderId() == null || placedBuy.qty() == null || placedBuy.qty().signum() <= 0) {
                 return autoPauseAndZero(s,
@@ -336,46 +328,51 @@ public class DrainService {
             }
             s.setBuyOrderId(placedBuy.orderId());
             s.setPBuy(placedBuy.price());
-
-            // синхронизируем объём продажи B с фактическим qty BUY
-            plannedSellQtyB = placedBuy.qty();
+            plannedSellQtyB = placedBuy.qty(); // синхронизируем объём продажи B с фактическим qty BUY
             s.setPlannedSellQtyB(plannedSellQtyB);
+
             log.info("[BUY_PLACED_SYNC] orderId={}, price={}, plannedBsellQty={} (expected remainder on B ≈ {})",
                     s.getBuyOrderId(), fmt(s.getPBuy()), fmt(plannedSellQtyB),
                     fmt(s.getQtyA().subtract(plannedSellQtyB)));
-            // === (4a) FAST CROSS на продаже B: сразу LIMIT IOC SELL (эмуляция MARKET SELL)
-            // === (4a) FAST CROSS на продаже B: сразу LIMIT IOC SELL (эмуляция MARKET SELL)
+
+            // === (4a) FAST CROSS: сразу LIMIT IOC SELL на B
             boolean fastSellOk = false;
             if (FAST_CROSS_IOC) {
-                try {
-                    Thread.sleep(BOOK_GLUE_SLEEP_MS);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                }
+                try { Thread.sleep(BOOK_GLUE_SLEEP_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
 
                 log.info("[B_SELL_SEND_FAST_IOC] limitSellBelowSpreadAccountB(symbol={}, qty={})",
                         symbol, fmt(plannedSellQtyB));
 
-                // ⬇️ NEW: снимок базы на B перед продажей текущего цикла (включает хвосты прошлых циклов)
+                // снимок базы на B перед продажей текущего цикла
                 s.setBBaseBeforeSell(mexcTradeService.getTokenBalanceAccountB(symbol, chatId));
                 log.info("[B_SELL_PRECHECK] bBaseBeforeSell={} (will sell={})",
                         fmt(s.getBBaseBeforeSell()), fmt(plannedSellQtyB));
-                // ⬆️ NEW
 
                 mexcTradeService.limitSellBelowSpreadAccountB(symbol, plannedSellQtyB, chatId);
                 s.setState(DrainSession.State.B_MKT_SELL_SENT);
-                log.info("[B_SELL_FAST_IOC_SENT]");
-
-                // Проверяем, что база на B реально списалась
+                // postcheck: реально ли списалась база на B
                 fastSellOk = (reconciler.checkAfterBSell(symbol, chatId, s) == Reconciler.Verdict.OK);
                 log.info("[B_SELL_FAST_POSTCHECK] ok={}", fastSellOk);
+
+                // === NEW: если быстрая IOC-продажа НЕ прошла (обычно notional < 1) —
+                // отменяем A-BUY и ставим автопаузу, чтобы не зависать.
+                if (!fastSellOk) {
+                    try {
+                        mexcTradeService.cancelOrderAccountA(symbol, s.getBuyOrderId(), chatId);
+                        log.warn("[A-BUY-CANCELLED] buyOrderId={} из-за неуспешного B IOC SELL", s.getBuyOrderId());
+                    } catch (Exception e) {
+                        log.warn("[A-BUY-CANCEL-FAIL] orderId={} err={}", s.getBuyOrderId(), e.getMessage());
+                    }
+                    return autoPauseAndZero(
+                            s,
+                            DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
+                            "B IOC SELL не выполнен (вероятно notional < minNotional). Цикл остановлен.",
+                            "B-SELL-IOC-FAST-FAIL"
+                    );
+                }
             }
 
-
-            int ensureGrace = fastSellOk
-                    ? Math.min(FAST_ENSURE_GRACE_MS, cfg.getPostPlaceGraceMs())
-                    : cfg.getPostPlaceGraceMs();
-
+            int ensureGrace = Math.min(FAST_ENSURE_GRACE_MS, cfg.getPostPlaceGraceMs());
             var rqBuy = mexcTradeService.ensureTopBidOrRequoteBuy(
                     symbol, chatId,
                     s.getBuyOrderId(), s.getPBuy(),
@@ -425,17 +422,14 @@ public class DrainService {
                 log.info("[BUY_RECHECK_OK] orderId={}, price={}", s.getBuyOrderId(), fmt(s.getPBuy()));
             }
 
-            // === (5) ФОЛБЭК: если быстрый крест на продаже B не подтвердился — продаём сейчас
-// === (5) ФОЛБЭК: если быстрый крест на продаже B не подтвердился — продаём сейчас
-            if (!fastSellOk) {
+            // === (5) ФОЛБЭК: если «быстрый» блок был выключен (на всякий случай оставляем)
+            if (!FAST_CROSS_IOC) {
                 log.info("[B_SELL_SEND] limitSellBelowSpreadAccountB(symbol={}, qty={})",
                         symbol, fmt(plannedSellQtyB));
 
-                // ⬇️ NEW: повторно фиксируем снимок базы на B именно перед фактической продажей
                 s.setBBaseBeforeSell(mexcTradeService.getTokenBalanceAccountB(symbol, chatId));
                 log.info("[B_SELL_PRECHECK_FALLBACK] bBaseBeforeSell={} (will sell={})",
                         fmt(s.getBBaseBeforeSell()), fmt(plannedSellQtyB));
-                // ⬆️ NEW
 
                 mexcTradeService.limitSellBelowSpreadAccountB(symbol, plannedSellQtyB, chatId);
                 s.setState(DrainSession.State.B_MKT_SELL_SENT);
@@ -444,9 +438,17 @@ public class DrainService {
                 var vSellB = reconciler.checkAfterBSell(symbol, chatId, s);
                 log.info("[B_SELL_POSTCHECK] verdict={}", vSellB);
                 if (vSellB != Reconciler.Verdict.OK) {
+                    // === NEW: отменяем A-BUY перед автопаузой
+                    try {
+                        mexcTradeService.cancelOrderAccountA(symbol, s.getBuyOrderId(), chatId);
+                        log.warn("[A-BUY-CANCELLED] buyOrderId={} из-за неуспешного B SELL (fallback)", s.getBuyOrderId());
+                    } catch (Exception e) {
+                        log.warn("[A-BUY-CANCEL-FAIL] orderId={} err={}", s.getBuyOrderId(), e.getMessage());
+                    }
+
                     return autoPauseAndZero(s,
                             DrainSession.AutoPauseReason.PARTIAL_MISMATCH,
-                            "После MARKET SELL на B осталась не-пыль.",
+                            "После MARKET SELL на B осталась не-пыль/не прошло minNotional.",
                             "B-SELL-VERIFY");
                 }
             }
@@ -493,6 +495,7 @@ public class DrainService {
             return BigDecimal.ZERO;
         }
     }
+
 
 
     // Ручная пауза
