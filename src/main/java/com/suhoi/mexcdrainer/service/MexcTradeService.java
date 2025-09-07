@@ -35,6 +35,7 @@ public class MexcTradeService {
     private static final String EXCHANGE_INFO_ENDPOINT = "/api/v3/exchangeInfo";
 
     public static final long EXCHANGE_INFO_TTL_MS = 60_000L;
+    private final MexcTradeWsService ws;
 
     // --- Комиссии (настраиваемые). По умолчанию 0.2% и небольшой safety-запас.
     private static final BigDecimal MAKER_FEE = new BigDecimal("0.0000"); // 0%
@@ -1357,6 +1358,18 @@ public class MexcTradeService {
 
 
     public BigDecimal getNearLowerSpreadPrice(String symbol, Long chatId, int depthLimit) {
+        var opt = ws.wsBest(symbol);
+        if (opt.isPresent()) {
+            var f = getSymbolFilters(symbol);
+            BigDecimal ask = opt.get().getAskPrice();
+            if (f != null && f.tickSize != null && f.tickSize.signum() > 0) {
+                int eps = appProperties.getDrain().getEpsilonTicks();
+                BigDecimal p = ask.subtract(f.tickSize.multiply(BigDecimal.valueOf(eps)));
+                return p.max(f.tickSize);
+            }
+            return ask;
+        }
+        // Fallback- через REST
         var top = topExcludingSelf(symbol, chatId, depthLimit);
         var f = getSymbolFilters(symbol);
         if (top.bid().signum() <= 0 && top.ask().signum() <= 0) {
@@ -1372,6 +1385,17 @@ public class MexcTradeService {
     }
 
     public BigDecimal getNearUpperSpreadPrice(String symbol, Long chatId, int depthLimit) {
+        var opt = ws.wsBest(symbol);
+        if (opt.isPresent()) {
+            var f = getSymbolFilters(symbol);
+            BigDecimal bid = opt.get().getBidPrice();
+            if (f != null && f.tickSize != null && f.tickSize.signum() > 0) {
+                int eps = appProperties.getDrain().getEpsilonTicks();
+                return bid.add(f.tickSize.multiply(BigDecimal.valueOf(eps)));
+            }
+            return bid;
+        }
+        // Fallback через REST
         var top = topExcludingSelf(symbol, chatId, depthLimit);
         var f = getSymbolFilters(symbol);
         if (top.bid().signum() <= 0 && top.ask().signum() <= 0) {

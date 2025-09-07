@@ -15,21 +15,18 @@ import java.math.RoundingMode;
 @RequiredArgsConstructor
 public class DrainService {
 
-    private static final boolean FAST_CROSS_IOC = true;      // быстрый выкуп через LIMIT IOC на B сразу после A-SELL
-    private static final int FAST_ENSURE_GRACE_MS = 150;     // «быстрый» grace для ensure после неудачного IOC
-    private static final int FAST_MAX_REQUOTES = 1;        // максимум 1 перестановка в «быстром» сценарии
-    private static final int BOOK_GLUE_SLEEP_MS = 15;       // микро-пауза чтобы книга «проклеилась» после A-SELL
+    private static final boolean FAST_CROSS_IOC = true;   // быстрый выкуп через LIMIT IOC на B сразу после A-SELL
+    private static final int FAST_ENSURE_GRACE_MS = 150;  // «быстрый» grace для ensure после неудачного IOC
+    private static final int FAST_MAX_REQUOTES = 1;       // максимум перестановок в «быстром» сценарии
 
-    private final MexcTradeService mexcTradeService;
+    private final MexcTradeWsService ws;                 // фасад WS
+    private final MexcTradeService mexcTradeService;     // REST и бизнес-операции
     private final Reconciler reconciler;
     private final AppProperties props;
-    private final TelegramService tg; // бин телеги
+    private final TelegramService tg;
 
-    // ---------- helpers: форматирование и снимки состояния ----------
-
-    private static String fmt(BigDecimal x) {
-        return x == null ? "null" : x.stripTrailingZeros().toPlainString();
-    }
+    // ---------- helpers ----------
+    private static String fmt(BigDecimal x) { return x == null ? "null" : x.stripTrailingZeros().toPlainString(); }
 
     private String snapshot(DrainSession s) {
         if (s == null) return "{session=null}";
@@ -50,19 +47,13 @@ public class DrainService {
                 .toString();
     }
 
-    /**
-     * Унифицированная автопауза + подробный лог в консоль.
-     */
-    private BigDecimal autoPauseAndZero(DrainSession s,
-                                        DrainSession.AutoPauseReason reason,
-                                        String details,
-                                        String whereTag) {
+    private BigDecimal autoPauseAndZero(DrainSession s, DrainSession.AutoPauseReason reason, String details, String whereTag) {
         s.autoPause(reason, details);
         log.warn("⏸ AUTO_PAUSE@{} -> reason={} | details={} | {}", whereTag, reason, details, snapshot(s));
         return BigDecimal.ZERO;
     }
 
-    // -----------------------------------------------------------------
+    // ---------- API ----------
 
     public void startDrain(String symbol, BigDecimal usdtAmount, Long chatId, int cycles) {
         var flag = MemoryDb.getFlag(chatId);
@@ -74,7 +65,7 @@ public class DrainService {
         try {
             log.info("🚀 START_DRAIN: symbol={}, amount={} USDT, cycles={}", symbol, fmt(usdtAmount), cycles);
 
-            // 0) Рынок BUY на A
+            // 0) MKT BUY на A
             var buyA = mexcTradeService.marketBuyAccountAFull(symbol, usdtAmount, chatId);
             log.info("A_MKT_BUY_RESULT: status={}, executedQty={}, cummQuote={}, avg={}",
                     buyA == null ? "null" : buyA.status(),
@@ -92,6 +83,9 @@ public class DrainService {
             s.setState(DrainSession.State.A_MKT_BUY_DONE);
             s.setQtyA(buyA.executedQty());
             MemoryDb.setSession(chatId, s);
+
+            // готовим WS (приватные сокеты A/B + подписка на bookTicker)
+            ws.prepareWs(chatId, symbol);
 
             log.info("SESSION_INIT {}", snapshot(s));
             tg.reply(chatId, "✅ A купил ~%s токенов @avg=%s".formatted(
@@ -116,12 +110,12 @@ public class DrainService {
                 }
                 s.setQtyA(next);
             }
+
             var sEnd = MemoryDb.getSession(chatId);
             if (sEnd != null && !(sEnd.getState() == DrainSession.State.AUTO_PAUSE
                     && sEnd.getReason() == DrainSession.AutoPauseReason.MANUAL)) {
                 finalSweepSellIfPossible(chatId, symbol);
             }
-
 
         } catch (Exception e) {
             log.error("❌ Ошибка в startDrain", e);
@@ -138,19 +132,16 @@ public class DrainService {
             long tCycle = System.currentTimeMillis();
             var cfg = props.getDrain();
 
-            // === (1) A SELL — рядом с нижней кромкой
+            // (1) A SELL — около нижней кромки
             var f = mexcTradeService.getSymbolFilters(symbol);
 
             BigDecimal nearSell = mexcTradeService.getNearLowerSpreadPrice(symbol, chatId, cfg.getDepthLimit());
             BigDecimal minQtyForSell = minQtyForNotional(nearSell, f);
 
             if (s.getQtyA() == null || s.getQtyA().compareTo(minQtyForSell) < 0) {
-                return autoPauseAndZero(
-                        s,
-                        DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
+                return autoPauseAndZero(s, DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
                         "qtyA < minQtyForNotional для SELL @ " + fmt(nearSell) + " (qtyA=" + fmt(s.getQtyA()) + ", min=" + fmt(minQtyForSell) + ")",
-                        "PRE-A-SELL-MIN"
-                );
+                        "PRE-A-SELL-MIN");
             }
 
             log.info("[SELL_PLANNED] nearSell={}, planQtyA={}", fmt(nearSell), fmt(s.getQtyA()));
@@ -160,19 +151,17 @@ public class DrainService {
                     placedSell.orderId(), fmt(placedSell.price()), fmt(placedSell.qty()));
 
             if (placedSell.orderId() == null || placedSell.qty() == null || placedSell.qty().signum() <= 0) {
-                return autoPauseAndZero(s,
-                        DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
-                        "SELL не прошёл minNotional/minQty.",
-                        "A-SELL-PLACE-FAIL");
+                return autoPauseAndZero(s, DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
+                        "SELL не прошёл minNotional/minQty.", "A-SELL-PLACE-FAIL");
             }
             s.setSellOrderId(placedSell.orderId());
             s.setPSell(placedSell.price());
             s.setQtyA(placedSell.qty());
             s.setState(DrainSession.State.A_SELL_PLACED);
 
-            // === (1a) FAST PATH: сразу B LIMIT IOC BUY по нашему pSell/qtyA
+            // (1a) FAST PATH: сразу B LIMIT IOC BUY
             if (FAST_CROSS_IOC) {
-                try { Thread.sleep(BOOK_GLUE_SLEEP_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                ws.awaitNextTick(symbol, Math.min(120, props.getDrain().getWs().getMaxStalenessMs()));
 
                 log.info("[B_BUY_SEND_FAST_IOC] limitIocBuyFromAccountB(symbol={}, price={}, qty={})",
                         symbol, fmt(s.getPSell()), fmt(s.getQtyA()));
@@ -185,7 +174,6 @@ public class DrainService {
                 log.info("[B_BUY_FAST_POSTCHECK] verdict={}", vBuyB_fast);
 
                 if (vBuyB_fast != Reconciler.Verdict.OK) {
-                    // Быстрый ensure A-SELL
                     var rqSell = mexcTradeService.ensureTopAskOrRequoteSell(
                             symbol, chatId,
                             s.getSellOrderId(), s.getPSell(), s.getQtyA(),
@@ -195,17 +183,14 @@ public class DrainService {
                             Math.min(FAST_ENSURE_GRACE_MS, cfg.getPostPlaceGraceMs())
                     );
                     if (!rqSell.ok()) {
-                        return autoPauseAndZero(s,
-                                DrainSession.AutoPauseReason.UNKNOWN,
-                                "ensureTopAskOrRequoteSell (fast) -> not ok",
-                                "A-SELL-ENSURE-FAST");
+                        return autoPauseAndZero(s, DrainSession.AutoPauseReason.UNKNOWN,
+                                "ensureTopAskOrRequoteSell (fast) -> not ok", "A-SELL-ENSURE-FAST");
                     }
                     s.setSellOrderId(rqSell.orderId());
                     s.setPSell(rqSell.price());
                     log.info("[SELL_ENSURED_FAST] orderId={}, price={}, qty={}",
                             s.getSellOrderId(), fmt(s.getPSell()), fmt(s.getQtyA()));
 
-                    // Фолбэк: MARKET BUY на B
                     log.info("[B_BUY_SEND_FALLBACK_MKT] marketBuyFromAccountB(symbol={}, pSell={}, qtyA={})",
                             symbol, fmt(s.getPSell()), fmt(s.getQtyA()));
                     BigDecimal spent = mexcTradeService.marketBuyFromAccountB(symbol, s.getPSell(), s.getQtyA(), chatId, true);
@@ -216,14 +201,11 @@ public class DrainService {
                     var vBuyB_fb = reconciler.checkAfterBBuy(symbol, chatId, s);
                     log.info("[B_BUY_POSTCHECK] verdict={}", vBuyB_fb);
                     if (vBuyB_fb != Reconciler.Verdict.OK) {
-                        return autoPauseAndZero(s,
-                                DrainSession.AutoPauseReason.PARTIAL_MISMATCH,
-                                "После MARKET BUY на B база отсутствует.",
-                                "B-BUY-VERIFY");
+                        return autoPauseAndZero(s, DrainSession.AutoPauseReason.PARTIAL_MISMATCH,
+                                "После MARKET BUY на B база отсутствует.", "B-BUY-VERIFY");
                     }
                 }
             } else {
-                // Медленный путь
                 var rqSell = mexcTradeService.ensureTopAskOrRequoteSell(
                         symbol, chatId,
                         s.getSellOrderId(), s.getPSell(), s.getQtyA(),
@@ -233,20 +215,14 @@ public class DrainService {
                         cfg.getPostPlaceGraceMs()
                 );
                 if (!rqSell.ok()) {
-                    return autoPauseAndZero(s,
-                            DrainSession.AutoPauseReason.UNKNOWN,
-                            "ensureTopAskOrRequoteSell -> not ok",
-                            "A-SELL-ENSURE");
+                    return autoPauseAndZero(s, DrainSession.AutoPauseReason.UNKNOWN,
+                            "ensureTopAskOrRequoteSell -> not ok", "A-SELL-ENSURE");
                 }
                 s.setSellOrderId(rqSell.orderId());
                 s.setPSell(rqSell.price());
 
                 log.info("[SELL_ENSURED] orderId={}, price={}, qty={}",
                         s.getSellOrderId(), fmt(s.getPSell()), fmt(s.getQtyA()));
-                log.info("A ➡ SELL лимитка {} токенов @ {} (orderId={})",
-                        s.getQtyA().stripTrailingZeros(),
-                        s.getPSell().stripTrailingZeros(),
-                        s.getSellOrderId());
 
                 log.info("[B_BUY_SEND] marketBuyFromAccountB(symbol={}, pSell={}, qtyA={})",
                         symbol, fmt(s.getPSell()), fmt(s.getQtyA()));
@@ -258,30 +234,23 @@ public class DrainService {
                 var vBuyB = reconciler.checkAfterBBuy(symbol, chatId, s);
                 log.info("[B_BUY_POSTCHECK] verdict={}", vBuyB);
                 if (vBuyB != Reconciler.Verdict.OK) {
-                    return autoPauseAndZero(s,
-                            DrainSession.AutoPauseReason.PARTIAL_MISMATCH,
-                            "После MARKET BUY на B база отсутствует.",
-                            "B-BUY-VERIFY");
+                    return autoPauseAndZero(s, DrainSession.AutoPauseReason.PARTIAL_MISMATCH,
+                            "После MARKET BUY на B база отсутствует.", "B-BUY-VERIFY");
                 }
             }
 
-            // === (3) Ждём FILLED по A-SELL
-            var credsA = MemoryDb.getAccountA(chatId);
-            var sellAInfo = mexcTradeService.waitUntilFilled(symbol, s.getSellOrderId(), credsA.getApiKey(), credsA.getSecret(), 6000);
-            log.info("[A_SELL_FILLED?] status={}, executedQty={}, cummQuote={}, avg={}",
-                    sellAInfo.status(), fmt(sellAInfo.executedQty()), fmt(sellAInfo.cummQuoteQty()), fmt(sellAInfo.avgPrice()));
-
-            if (!"FILLED".equals(sellAInfo.status()) || sellAInfo.executedQty().signum() <= 0) {
-                return autoPauseAndZero(s,
-                        DrainSession.AutoPauseReason.TIMEOUT,
-                        "A SELL не FILLED (status=" + sellAInfo.status() + ")",
-                        "A-SELL-WAIT");
+            // (3) Ждём FILLED по A-SELL (приватный WS)
+            var sellUpd = ws.awaitOrderFilledA(symbol, s.getSellOrderId(), 6000, chatId).join();
+            log.info("[A_SELL_FILLED?] status={} cumQty={} avg={}",
+                    sellUpd.getStatus(), sellUpd.getCumulativeQuantity(), sellUpd.getAvgPrice());
+            if (!sellUpd.isFilled() || sellUpd.getCumulativeQuantity() == null || sellUpd.getCumulativeQuantity().signum() <= 0) {
+                return autoPauseAndZero(s, DrainSession.AutoPauseReason.TIMEOUT, "A SELL не FILLED (WS)", "A-SELL-WAIT");
             }
-            s.setLastCummA(sellAInfo.cummQuoteQty());
-            s.setQtyA(sellAInfo.executedQty());
+            s.setLastCummA(sellUpd.getCumulativeQuantity().multiply(sellUpd.getAvgPrice())); // ≈ cummQuote
+            s.setQtyA(sellUpd.getCumulativeQuantity());
             s.setState(DrainSession.State.A_SELL_FILLED);
 
-            // === (4) A BUY — верхняя кромка
+            // (4) A BUY — верхняя кромка
             BigDecimal nearBuy = mexcTradeService.getNearUpperSpreadPrice(symbol, chatId, cfg.getDepthLimit());
             log.info("[BUY_PLANNED] nearBuy={}, lastCummA={}, qtyB_to_sell_likeA={}",
                     fmt(nearBuy), fmt(s.getLastCummA()), fmt(s.getQtyA()));
@@ -289,10 +258,8 @@ public class DrainService {
             BigDecimal plannedSellQtyB = mexcTradeService.planMarketSellQtyAccountB(symbol, nearBuy, s.getQtyA(), chatId);
             log.info("[B_SELL_PLAN] plannedSellQtyB={}", fmt(plannedSellQtyB));
             if (plannedSellQtyB.compareTo(BigDecimal.ZERO) <= 0) {
-                return autoPauseAndZero(s,
-                        DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
-                        "B не может выставить MARKET SELL ≥ minNotional.",
-                        "B-SELL-PLAN");
+                return autoPauseAndZero(s, DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
+                        "B не может выставить MARKET SELL ≥ minNotional.", "B-SELL-PLAN");
             }
 
             BigDecimal spendA = mexcTradeService.reserveForMakerFee(s.getLastCummA());
@@ -302,60 +269,48 @@ public class DrainService {
             log.info("[BUY_BUDGET] spendA={}, capByQty={}, plannedSellQtyB={}",
                     fmt(spendA), fmt(capByQty), fmt(plannedSellQtyB));
 
-            // стоп-условие: если бюджет A для BUY меньше minNotional — дальше крутить цикл бессмысленно
+            // стоп-условие minNotional
             if (f != null && f.minNotional != null && f.minNotional.signum() > 0 && spendA.compareTo(f.minNotional) < 0) {
-                return autoPauseAndZero(
-                        s,
-                        DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
+                return autoPauseAndZero(s, DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
                         "spendA < minNotional для BUY (spendA=" + fmt(spendA) + ", minNotional=" + fmt(f.minNotional) + ")",
-                        "PRE-A-BUY-MIN"
-                );
+                        "PRE-A-BUY-MIN");
             }
 
             var placedBuy = mexcTradeService.placeLimitBuyAccountAPlaced(symbol, nearBuy, spendA, plannedSellQtyB, chatId);
             log.info("[BUY_PLACED] orderId={}, price={}, qty={} (requestedBudget={}, requestedMaxQty={})",
-                    placedBuy.orderId(),
-                    fmt(placedBuy.price()),
-                    fmt(placedBuy.qty()),
-                    fmt(spendA),
-                    fmt(plannedSellQtyB));
+                    placedBuy.orderId(), fmt(placedBuy.price()), fmt(placedBuy.qty()), fmt(spendA), fmt(plannedSellQtyB));
 
             if (placedBuy.orderId() == null || placedBuy.qty() == null || placedBuy.qty().signum() <= 0) {
-                return autoPauseAndZero(s,
-                        DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
-                        "BUY не прошёл minNotional/minQty.",
-                        "A-BUY-PLACE-FAIL");
+                return autoPauseAndZero(s, DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
+                        "BUY не прошёл minNotional/minQty.", "A-BUY-PLACE-FAIL");
             }
             s.setBuyOrderId(placedBuy.orderId());
             s.setPBuy(placedBuy.price());
-            plannedSellQtyB = placedBuy.qty(); // синхронизируем объём продажи B с фактическим qty BUY
+            plannedSellQtyB = placedBuy.qty();
             s.setPlannedSellQtyB(plannedSellQtyB);
 
-            log.info("[BUY_PLACED_SYNC] orderId={}, price={}, plannedBsellQty={} (expected remainder on B ≈ {})",
+            log.info("[BUY_PLACED_SYNC] orderId={}, price={}, plannedBsellQty={} (expected B remainder ≈ {})",
                     s.getBuyOrderId(), fmt(s.getPBuy()), fmt(plannedSellQtyB),
                     fmt(s.getQtyA().subtract(plannedSellQtyB)));
 
-            // === (4a) FAST CROSS: сразу LIMIT IOC SELL на B
+            // (4a) FAST CROSS: сразу LIMIT IOC SELL на B
             boolean fastSellOk = false;
             if (FAST_CROSS_IOC) {
-                try { Thread.sleep(BOOK_GLUE_SLEEP_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                ws.awaitNextTick(symbol, Math.min(120, props.getDrain().getWs().getMaxStalenessMs()));
 
                 log.info("[B_SELL_SEND_FAST_IOC] limitSellBelowSpreadAccountB(symbol={}, qty={})",
                         symbol, fmt(plannedSellQtyB));
 
-                // снимок базы на B перед продажей текущего цикла
                 s.setBBaseBeforeSell(mexcTradeService.getTokenBalanceAccountB(symbol, chatId));
                 log.info("[B_SELL_PRECHECK] bBaseBeforeSell={} (will sell={})",
                         fmt(s.getBBaseBeforeSell()), fmt(plannedSellQtyB));
 
                 mexcTradeService.limitSellBelowSpreadAccountB(symbol, plannedSellQtyB, chatId);
                 s.setState(DrainSession.State.B_MKT_SELL_SENT);
-                // postcheck: реально ли списалась база на B
+
                 fastSellOk = (reconciler.checkAfterBSell(symbol, chatId, s) == Reconciler.Verdict.OK);
                 log.info("[B_SELL_FAST_POSTCHECK] ok={}", fastSellOk);
 
-                // === NEW: если быстрая IOC-продажа НЕ прошла (обычно notional < 1) —
-                // отменяем A-BUY и ставим автопаузу, чтобы не зависать.
                 if (!fastSellOk) {
                     try {
                         mexcTradeService.cancelOrderAccountA(symbol, s.getBuyOrderId(), chatId);
@@ -363,12 +318,8 @@ public class DrainService {
                     } catch (Exception e) {
                         log.warn("[A-BUY-CANCEL-FAIL] orderId={} err={}", s.getBuyOrderId(), e.getMessage());
                     }
-                    return autoPauseAndZero(
-                            s,
-                            DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
-                            "B IOC SELL не выполнен (вероятно notional < minNotional). Цикл остановлен.",
-                            "B-SELL-IOC-FAST-FAIL"
-                    );
+                    return autoPauseAndZero(s, DrainSession.AutoPauseReason.INSUFFICIENT_BALANCE,
+                            "B IOC SELL не выполнен (вероятно notional < minNotional).", "B-SELL-IOC-FAST-FAIL");
                 }
             }
 
@@ -383,23 +334,15 @@ public class DrainService {
                     ensureGrace
             );
             if (!rqBuy.ok()) {
-                return autoPauseAndZero(s,
-                        DrainSession.AutoPauseReason.UNKNOWN,
-                        "ensureTopBidOrRequoteBuy -> not ok",
-                        "A-BUY-ENSURE");
+                return autoPauseAndZero(s, DrainSession.AutoPauseReason.UNKNOWN,
+                        "ensureTopBidOrRequoteBuy -> not ok", "A-BUY-ENSURE");
             }
             s.setBuyOrderId(rqBuy.orderId());
             s.setPBuy(rqBuy.price());
 
             log.info("[BUY_ENSURED] orderId={}, price={}, plannedBsellQty={}",
                     s.getBuyOrderId(), fmt(s.getPBuy()), fmt(plannedSellQtyB));
-            log.info("A ➡ BUY лимитка {} USDT @ {} (maxQty={} ; orderId={})",
-                    fmt(spendA),
-                    s.getPBuy().stripTrailingZeros(),
-                    plannedSellQtyB.stripTrailingZeros(),
-                    s.getBuyOrderId());
 
-            // быстрый sanity-check на подрезание
             var vBuyPlaced = reconciler.checkAfterBuyPlaced(symbol, chatId, s);
             log.info("[BUY_POSTCHECK] verdict={}", vBuyPlaced);
             if (vBuyPlaced != Reconciler.Verdict.OK) {
@@ -407,14 +350,10 @@ public class DrainService {
                         symbol, chatId,
                         s.getBuyOrderId(), s.getPBuy(),
                         spendA, plannedSellQtyB,
-                        /*maxRequotes*/ 1,
-                        cfg.getEpsilonTicks(),
-                        cfg.getDepthLimit(),
-                        /*postPlaceGraceMs*/ 40
+                        1, cfg.getEpsilonTicks(), cfg.getDepthLimit(), 40
                 );
                 if (!rq2.ok()) {
-                    return autoPauseAndZero(s,
-                            DrainSession.AutoPauseReason.FRONT_RUN,
+                    return autoPauseAndZero(s, DrainSession.AutoPauseReason.FRONT_RUN,
                             "После A-BUY нас подрезали повторно.", "A-BUY-RECHECK");
                 }
                 s.setBuyOrderId(rq2.orderId());
@@ -422,60 +361,24 @@ public class DrainService {
                 log.info("[BUY_RECHECK_OK] orderId={}, price={}", s.getBuyOrderId(), fmt(s.getPBuy()));
             }
 
-            // === (5) ФОЛБЭК: если «быстрый» блок был выключен (на всякий случай оставляем)
-            if (!FAST_CROSS_IOC) {
-                log.info("[B_SELL_SEND] limitSellBelowSpreadAccountB(symbol={}, qty={})",
-                        symbol, fmt(plannedSellQtyB));
+            // (5) Если FAST выключен — fallback-секция (опущено, т.к. FAST_CROSS_IOC=true)
 
-                s.setBBaseBeforeSell(mexcTradeService.getTokenBalanceAccountB(symbol, chatId));
-                log.info("[B_SELL_PRECHECK_FALLBACK] bBaseBeforeSell={} (will sell={})",
-                        fmt(s.getBBaseBeforeSell()), fmt(plannedSellQtyB));
-
-                mexcTradeService.limitSellBelowSpreadAccountB(symbol, plannedSellQtyB, chatId);
-                s.setState(DrainSession.State.B_MKT_SELL_SENT);
-                log.info("[B_SELL_SENT] ok");
-
-                var vSellB = reconciler.checkAfterBSell(symbol, chatId, s);
-                log.info("[B_SELL_POSTCHECK] verdict={}", vSellB);
-                if (vSellB != Reconciler.Verdict.OK) {
-                    // === NEW: отменяем A-BUY перед автопаузой
-                    try {
-                        mexcTradeService.cancelOrderAccountA(symbol, s.getBuyOrderId(), chatId);
-                        log.warn("[A-BUY-CANCELLED] buyOrderId={} из-за неуспешного B SELL (fallback)", s.getBuyOrderId());
-                    } catch (Exception e) {
-                        log.warn("[A-BUY-CANCEL-FAIL] orderId={} err={}", s.getBuyOrderId(), e.getMessage());
-                    }
-
-                    return autoPauseAndZero(s,
-                            DrainSession.AutoPauseReason.PARTIAL_MISMATCH,
-                            "После MARKET SELL на B осталась не-пыль/не прошло minNotional.",
-                            "B-SELL-VERIFY");
-                }
-            }
-
-            // === (6) Ждём FILLED по A-BUY — это next qty
-            var credsA2 = MemoryDb.getAccountA(chatId);
-            var buyAInfo = mexcTradeService.waitUntilFilled(symbol, s.getBuyOrderId(), credsA2.getApiKey(), credsA2.getSecret(), 6000);
-            log.info("[A_BUY_FILLED?] status={}, executedQty={}, cummQuote={}, avg={}",
-                    buyAInfo.status(), fmt(buyAInfo.executedQty()), fmt(buyAInfo.cummQuoteQty()), fmt(buyAInfo.avgPrice()));
-
-            if (!"FILLED".equals(buyAInfo.status()) || buyAInfo.executedQty().signum() <= 0) {
-                return autoPauseAndZero(s,
-                        DrainSession.AutoPauseReason.TIMEOUT,
-                        "A BUY не FILLED (status=" + buyAInfo.status() + ")",
-                        "A-BUY-WAIT");
+            // (6) Ждём FILLED по A-BUY (это next qty)
+            var buyUpd = ws.awaitOrderFilledA(symbol, s.getBuyOrderId(), 6000, chatId).join();
+            log.info("[A_BUY_FILLED?] status={} cumQty={} avg={}",
+                    buyUpd.getStatus(), buyUpd.getCumulativeQuantity(), buyUpd.getAvgPrice());
+            if (!buyUpd.isFilled() || buyUpd.getCumulativeQuantity() == null || buyUpd.getCumulativeQuantity().signum() <= 0) {
+                return autoPauseAndZero(s, DrainSession.AutoPauseReason.TIMEOUT, "A BUY не FILLED (WS)", "A-BUY-WAIT");
             }
 
             long dt = System.currentTimeMillis() - tCycle;
-            log.info("✅ Цикл {} завершён за {} ms. A получил {} токенов (avg={}), потратил {} USDT.",
-                    s.getCycleIndex(),
-                    dt,
-                    buyAInfo.executedQty().stripTrailingZeros().toPlainString(),
-                    buyAInfo.avgPrice().stripTrailingZeros().toPlainString(),
-                    buyAInfo.cummQuoteQty().stripTrailingZeros().toPlainString());
+            log.info("✅ Цикл {} завершён за {} ms. A получил {} токенов (avg={})",
+                    s.getCycleIndex(), dt,
+                    buyUpd.getCumulativeQuantity().stripTrailingZeros().toPlainString(),
+                    buyUpd.getAvgPrice().stripTrailingZeros().toPlainString());
 
             s.setState(DrainSession.State.A_BUY_FILLED);
-            return buyAInfo.executedQty();
+            return buyUpd.getCumulativeQuantity();
 
         } catch (Exception e) {
             log.error("❌ Ошибка в executeCycleWithGuards: {} | {}", e.getClass().getSimpleName(), e.getMessage(), e);
@@ -496,9 +399,6 @@ public class DrainService {
         }
     }
 
-
-
-    // Ручная пауза
     public void requestStop(Long chatId) {
         var s = MemoryDb.getSession(chatId);
         if (s == null) return;
@@ -506,7 +406,6 @@ public class DrainService {
         log.warn("🛑 MANUAL_STOP {}", snapshot(s));
     }
 
-    // Продолжение из факта балансов
     public void continueFromBalances(String symbol, Long chatId, int cycles) {
         var flag = MemoryDb.getFlag(chatId);
         if (!flag.compareAndSet(false, true)) {
@@ -528,7 +427,9 @@ public class DrainService {
             s.setQtyA(aBase);
             s.setState(DrainSession.State.A_MKT_BUY_DONE);
             MemoryDb.setSession(chatId, s);
-            log.info("CONTINUE_SESSION_INIT {}", snapshot(s));
+
+            // готовим WS
+            ws.prepareWs(chatId, symbol);
 
             int i = 0;
             boolean unlimited = (cycles <= 0);
@@ -555,25 +456,21 @@ public class DrainService {
         var s = MemoryDb.getSession(chatId);
         if (s == null) return "Статус: нет активной сессии.";
         return "Статус: %s | цикл %d | pSell=%s | pBuy=%s | reason=%s (%s)".formatted(
-                s.getState(), s.getCycleIndex(),
-                s.getPSell(), s.getPBuy(),
-                s.getReason(), s.getReasonDetails());
+                s.getState(), s.getCycleIndex(), s.getPSell(), s.getPBuy(), s.getReason(), s.getReasonDetails());
     }
-    // внутри DrainService (рядом с helper fmt(..))
 
-    /**
-     * Минимальное кол-во base, чтобы ордер прошёл minNotional на заданной цене, учитывая stepSize и minQty.
-     */
+    // --- utils ---
+
+    /** Минимальное кол-во base, чтобы пройти minNotional/minQty при цене price. */
     private BigDecimal minQtyForNotional(BigDecimal price, MexcTradeService.SymbolFilters f) {
         if (f == null) return BigDecimal.ZERO;
         BigDecimal minQty = (f.minQty != null) ? f.minQty : BigDecimal.ZERO;
 
-        // если у тикера нет minNotional, достаточно minQty
         if (f.minNotional == null || f.minNotional.signum() <= 0 || price == null || price.signum() <= 0) {
             return minQty;
         }
 
-        BigDecimal raw = f.minNotional.divide(price, 16, RoundingMode.UP); // сколько штук нужно при этой цене
+        BigDecimal raw = f.minNotional.divide(price, 16, RoundingMode.UP);
         if (f.stepSize != null && f.stepSize.signum() > 0) {
             BigDecimal steps = raw.divide(f.stepSize, 0, RoundingMode.UP);
             return steps.multiply(f.stepSize).max(minQty);
@@ -581,9 +478,7 @@ public class DrainService {
         return raw.max(minQty);
     }
 
-    /**
-     * Финальный свип: если остаток на A проходит minNotional/minQty — сливаем MARKET SELL.
-     */
+    /** Финальный свип с MARKET SELL на A (если проходим минимумы). */
     private void finalSweepSellIfPossible(Long chatId, String symbol) {
         try {
             var f = mexcTradeService.getSymbolFilters(symbol);
@@ -592,8 +487,6 @@ public class DrainService {
                 log.info("FINAL_SWEEP_SKIP: пусто на A");
                 return;
             }
-
-            // Оценим по nearLowerSpread, пройдём ли minNotional
             BigDecimal nearSell = mexcTradeService.getNearLowerSpreadPrice(symbol, chatId, props.getDrain().getDepthLimit());
             BigDecimal minQtyForSell = minQtyForNotional(nearSell, f);
 
@@ -603,11 +496,10 @@ public class DrainService {
                 tg.reply(chatId, "🧹 Финальный SELL: продал остаток %s %s".formatted(
                         qtyA.stripTrailingZeros().toPlainString(), symbol.replace("USDT", "")));
             } else {
-                log.info("FINAL_SWEEP_SKIP: qtyA={} < minQtyForSell={} (пыль, оставляем).", fmt(qtyA), fmt(minQtyForSell));
+                log.info("FINAL_SWEEP_SKIP: qtyA={} < minQtyForSell={} (пыль).", fmt(qtyA), fmt(minQtyForSell));
             }
         } catch (Exception e) {
             log.error("FINAL_SWEEP_ERROR: {}", e.getMessage(), e);
         }
     }
-
 }

@@ -21,3 +21,17 @@ app:
     depthLimit: 20
     feeSafety: "0.0010"
     priceGuardPct: "0.08"
+    ws:
+      enabled: true
+      maxStalenessMs: 200
+      pingIntervalMs: 15000
+      reconnect:
+        baseDelayMs: 200
+        maxDelayMs: 5000
+        jitterPct: 30
+      market:
+        useDepth: false
+        depthScale: "0.1"
+        snapshotIntervalSec: 30
+      privateCfg:
+        refreshListenKeyMin: 25
