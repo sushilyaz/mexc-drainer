@@ -13,18 +13,21 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Универсальный WS-клиент на OkHttp 4.12.0:
  * - Автопинг (app-level PING) с единственной задачей;
- * - Экспоненциальный реконнект (с ограничением);
- * - SUB/UNSUB по протоколу MEXC (JSON {method, params});
- * - Хук onOpenHook(...) — для ресабскрая после реконнекта.
+ * - Экспоненциальный реконнект (без бесконечного роста задержки);
+ * - SUB/UNSUB сообщения по протоколу MEXC (JSON {method, params});
+ * - Хук onOpenHook(...) — для ресабскрайба каналов после реконнекта.
+ *
+ * Наследники обязаны реализовать onText(...) и onBinary(...), опционально onOpenHook(...).
  */
 @Slf4j
 public abstract class WsClient implements Closeable {
 
+    // --- Конфигурация и зависимости ---
     protected final String wsUrl;
     protected final ObjectMapper om;
 
     private final OkHttpClient http = new OkHttpClient.Builder()
-            .readTimeout(0, TimeUnit.MILLISECONDS) // бесконечное чтение
+            .readTimeout(0, TimeUnit.MILLISECONDS) // бесконечное чтение сокета
             .build();
 
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -33,14 +36,15 @@ public abstract class WsClient implements Closeable {
         return t;
     });
 
+    // --- Состояние соединения ---
     private volatile WebSocket socket;
     private volatile boolean closed = false;
 
-    // backoff
+    // --- Бэкофф реконнекта ---
     private final AtomicLong backoffMs = new AtomicLong(200);
     private final long maxBackoffMs = 5_000;
 
-    // ping
+    // --- Пинг ---
     private final int pingIntervalMs;
     private volatile ScheduledFuture<?> pingTask;
 
@@ -50,14 +54,20 @@ public abstract class WsClient implements Closeable {
         this.pingIntervalMs = pingIntervalMs;
     }
 
-    // Обязательные обработчики
+    // Наследники реализуют парсинг текстовых сообщений.
     protected abstract void onText(String text);
+
+    // Наследники реализуют при необходимости парсинг бинарных сообщений.
     protected abstract void onBinary(byte[] bytes);
 
-    // Хук на успешный open — удобно для ресабскрая
-    protected void onOpenHook(WebSocket ws) { /* no-op */ }
+    // Хук: вызывается в конце onOpen — удобно для повторного сабскрайба.
+    protected void onOpenHook(WebSocket ws) {
+        // no-op по умолчанию
+    }
 
-    /** Установить соединение. initialParams — одноразовые подписки. */
+    /**
+     * Установить соединение. initialParams — первый набор подписок (одноразово).
+     */
     public synchronized void connect(List<String> initialParams) {
         if (closed) return;
 
@@ -67,28 +77,30 @@ public abstract class WsClient implements Closeable {
                 log.info("[WS_OPEN] url={}", wsUrl);
                 backoffMs.set(200);
 
+                // Отправляем первоначальные подписки (если заданы)
                 if (initialParams != null && !initialParams.isEmpty()) {
                     sendSub(initialParams);
                 }
 
-                // единственный app-level PING
-                if (pingTask != null && !pingTask.isCancelled()) pingTask.cancel(false);
+                // Перезапускаем единственный app-level PING
+                if (pingTask != null && !pingTask.isCancelled()) {
+                    pingTask.cancel(false);
+                }
                 pingTask = scheduler.scheduleAtFixedRate(WsClient.this::safePing,
                         pingIntervalMs, pingIntervalMs, TimeUnit.MILLISECONDS);
 
+                // Даём шанс наследникам ресабскрайбиться
                 onOpenHook(ws);
             }
 
             @Override public void onMessage(WebSocket ws, String text) {
-                try { onText(text); } catch (Exception e) {
-                    log.warn("[WS_ON_TEXT_ERR] {}", e.getMessage(), e);
-                }
+                try { onText(text); }
+                catch (Exception e) { log.warn("[WS_ON_TEXT_ERR] {}", e.getMessage(), e); }
             }
 
             @Override public void onMessage(WebSocket ws, ByteString bytes) {
-                try { onBinary(bytes.toByteArray()); } catch (Exception e) {
-                    log.warn("[WS_ON_BIN_ERR] {}", e.getMessage(), e);
-                }
+                try { onBinary(bytes.toByteArray()); }
+                catch (Exception e) { log.warn("[WS_ON_BIN_ERR] {}", e.getMessage(), e); }
             }
 
             @Override public void onFailure(WebSocket ws, Throwable t, Response r) {
@@ -103,7 +115,7 @@ public abstract class WsClient implements Closeable {
         });
     }
 
-    // --- Протокол MEXC ---
+    // --- Протокол MEXC: SUB/UNSUB/PING ---
 
     public synchronized void sendSub(List<String> params) {
         if (socket == null) return;
@@ -132,12 +144,16 @@ public abstract class WsClient implements Closeable {
     public synchronized void sendPing() {
         if (socket == null) return;
         try {
-            socket.send(om.createObjectNode().put("method", "PING").toString());
+            var root = om.createObjectNode().put("method", "PING");
+            socket.send(root.toString());
         } catch (Exception e) {
             log.warn("[WS_PING_ERR] {}", e.getMessage(), e);
         }
     }
-    private void safePing() { try { sendPing(); } catch (Exception ignored) {} }
+
+    private void safePing() {
+        try { sendPing(); } catch (Exception ignored) {}
+    }
 
     // --- Реконнект ---
 
@@ -146,7 +162,8 @@ public abstract class WsClient implements Closeable {
         long delay = backoffMs.get();
         long next = Math.min((long) (delay * 1.8), maxBackoffMs);
         backoffMs.set(next);
-        // один вызов reconnect через текущий delay
+
+        // Планируем один вызов reconnect() через текущий delay
         scheduler.schedule(this::reconnect, delay, TimeUnit.MILLISECONDS);
     }
 
@@ -154,7 +171,9 @@ public abstract class WsClient implements Closeable {
         if (closed) return;
         try { if (socket != null) socket.cancel(); } catch (Exception ignored) {}
         log.info("[WS_RECONNECT] url={} delay={}ms", wsUrl, backoffMs.get());
-        connect(null); // каналы восстановит наследник в onOpenHook(...)
+
+        // Важно: без initialParams — наследник ресабскрайбит каналы в onOpenHook(...)
+        connect(null);
     }
 
     // --- Закрытие ---
@@ -163,7 +182,9 @@ public abstract class WsClient implements Closeable {
     public synchronized void close() {
         closed = true;
         try { if (socket != null) socket.close(1000, "bye"); } catch (Exception ignored) {}
-        if (pingTask != null) try { pingTask.cancel(true); } catch (Exception ignored) {}
+        if (pingTask != null) {
+            try { pingTask.cancel(true); } catch (Exception ignored) {}
+        }
         scheduler.shutdownNow();
     }
 }

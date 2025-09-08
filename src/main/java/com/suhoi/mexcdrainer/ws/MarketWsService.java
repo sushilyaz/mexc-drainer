@@ -31,9 +31,7 @@ public class MarketWsService {
 
     @PostConstruct
     void init() {
-        if (!isEnabled()) return;
-        client = new Inner(WS_ENDPOINT, om);
-        client.connect(List.of()); // пустой старт, подписки будем добавлять лениво
+        // ленивый старт — ничего не делаем
     }
 
     public boolean isEnabled() {
@@ -43,10 +41,20 @@ public class MarketWsService {
     }
 
     /** Лениво подписываемся на bookTicker символа (idempotent). */
-    public void ensureSubscribed(String symbol) {
-        if (!isEnabled() || client == null) return;
-        String ch = "spot@public.aggre.bookTicker.v3.api.pb@10ms@" + symbol.toUpperCase(Locale.ROOT);
-        client.subscribeIfNeeded(ch);
+    public synchronized void ensureSubscribed(String symbol) {
+        if (!isEnabled()) return;
+        String ch = "spot@public.aggre.bookTicker.v3.api@10ms@" + symbol.toUpperCase(Locale.ROOT);
+
+        if (client == null) {
+            client = new Inner(WS_ENDPOINT, om);
+            // 1) сначала регистрируем канал в subs (внутри add)
+            client.subscribeIfNeeded(ch);
+            // 2) только потом коннектимся без initialParams — onOpenHook ресабскраит всё из subs
+            client.connect(null);
+            log.info("[WS_MARKET_CONNECT+SUB] {}", ch);
+        } else {
+            client.subscribeIfNeeded(ch); // идемпотентно
+        }
     }
 
     /** Последний тикер, если он моложе maxStalenessMs. */
@@ -94,7 +102,11 @@ public class MarketWsService {
         }
 
         @Override protected void onOpenHook(WebSocket ws) {
-            if (!subs.isEmpty()) sendSub(new ArrayList<>(subs)); // ресабскрайб
+            sendSub(List.of(
+                    "spot@private.orders.v3.api",
+                    "spot@private.deals.v3.api",
+                    "spot@private.account.v3.api"
+            ));
         }
 
         @Override protected void onText(String text) {
