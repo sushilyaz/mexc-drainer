@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.suhoi.mexcdrainer.config.AppProperties;
 import com.suhoi.mexcdrainer.util.MemoryDb;
+import com.suhoi.mexcdrainer.ws.user.UserDataWsManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.*;
@@ -36,6 +37,7 @@ public class MexcTradeService {
 
     public static final long EXCHANGE_INFO_TTL_MS = 60_000L;
 
+    private final UserDataWsManager userDataWsManager;
     // --- Комиссии (настраиваемые). По умолчанию 0.2% и небольшой safety-запас.
     private static final BigDecimal MAKER_FEE = new BigDecimal("0.0000"); // 0%
     private static final BigDecimal TAKER_FEE = new BigDecimal("0.0005"); // 0.05%
@@ -155,6 +157,7 @@ public class MexcTradeService {
             return BigDecimal.ZERO;
         }
     }
+
     private BigDecimal guardSellPrice(String symbol, BigDecimal price) {
         BigDecimal pct = new BigDecimal(appProperties.getDrain().getPriceGuardPct());
         if (pct.signum() <= 0) return price;
@@ -416,10 +419,10 @@ public class MexcTradeService {
         }
 
         String orderId = resp.path("orderId").asText(null);
-        String status  = resp.path("status").asText("UNKNOWN");
+        String status = resp.path("status").asText("UNKNOWN");
         BigDecimal executed = bd(resp.path("executedQty").asText("0"));
-        BigDecimal cummQ    = bd(resp.path("cummulativeQuoteQty").asText("0"));
-        BigDecimal avg      = safeAvg(cummQ, executed);
+        BigDecimal cummQ = bd(resp.path("cummulativeQuoteQty").asText("0"));
+        BigDecimal avg = safeAvg(cummQ, executed);
 
         log.info("📤 LIMIT SELL[AGGR] {}#{} result: status={}, executedQty={}, cummQuoteQty={}, avg={}",
                 symbol, orderId, status, executed.toPlainString(), cummQ.toPlainString(), avg.toPlainString());
@@ -448,7 +451,8 @@ public class MexcTradeService {
         BigDecimal rawQty = BigDecimal.ZERO;
         try {
             rawQty = usdtAmount.divide(normPrice, 18, RoundingMode.DOWN);
-        } catch (Exception ignore) {}
+        } catch (Exception ignore) {
+        }
         BigDecimal qty = normalizeQty(rawQty, f);
 
         // ограничим сверху maxQty (если задан)
@@ -588,6 +592,7 @@ public class MexcTradeService {
 
         return normQty;
     }
+
     public BigDecimal marketBuyFromAccountB(String symbol, BigDecimal price, BigDecimal qty, Long chatId, boolean returnSpent) {
         var creds = MemoryDb.getAccountB(chatId);
         if (creds == null) throw new IllegalArgumentException("Нет ключей для accountB (chatId=" + chatId + ")");
@@ -987,6 +992,7 @@ public class MexcTradeService {
 
     public record TopOfBook(BigDecimal bid, BigDecimal ask) {
     }
+
     public TopOfBook topIncludingSelf(String symbol) {
         BookTicker t = fetchBookTicker(symbol);
         return new TopOfBook(t.bid(), t.ask());
@@ -1007,14 +1013,15 @@ public class MexcTradeService {
         String asks = d.asks().stream().limit(3)
                 .map(l -> l.price().stripTrailingZeros() + "×" + l.qty().stripTrailingZeros())
                 .collect(java.util.stream.Collectors.joining(" | "));
-        TopOfBook ex  = topExcludingSelf(symbol, chatId, depthLimit);
+        TopOfBook ex = topExcludingSelf(symbol, chatId, depthLimit);
         TopOfBook inc = topIncludingSelf(symbol);
         log.info("[BOOK] {} inc(bid/ask)={} / {} | ex-self(bid/ask)={} / {} | top3 bids: {} | top3 asks: {}",
                 symbol,
                 inc.bid().stripTrailingZeros(), inc.ask().stripTrailingZeros(),
-                ex.bid().stripTrailingZeros(),  ex.ask().stripTrailingZeros(),
+                ex.bid().stripTrailingZeros(), ex.ask().stripTrailingZeros(),
                 bids, asks);
     }
+
     public record RequoteResult(
             boolean ok,            // true: мы топ; false: лимит исчерпан, надо AUTO_PAUSE
             String reason,         // "OK" | "FRONT_RUN" | "BOOK_LAG"
@@ -1023,7 +1030,8 @@ public class MexcTradeService {
             TopOfBook exTop,       // чужой топ (ex-self)
             TopOfBook incTop,      // общий топ (inc-self)
             int attempts           // сколько раз переставляли
-    ) {}
+    ) {
+    }
 
     public RequoteResult ensureTopAskOrRequoteSell(
             String symbol, Long chatId,
@@ -1038,11 +1046,14 @@ public class MexcTradeService {
         final int grace = Math.max(10, postPlaceGraceMs); // короче, чем раньше
 
         for (int i = 0; i <= maxRequotes; ) {
-            try { Thread.sleep(grace); } catch (InterruptedException ignored) {}
+            try {
+                Thread.sleep(grace);
+            } catch (InterruptedException ignored) {
+            }
 
             // инклюзивный топ (видно НАШ ордер, если он уже в книге)
             TopOfBook inc = topIncludingSelf(symbol);
-            TopOfBook ex  = topExcludingSelf(symbol, chatId, depthLimit);
+            TopOfBook ex = topExcludingSelf(symbol, chatId, depthLimit);
 
             // 1) уже FILLED?
             var st = waitUntilFilled(symbol, orderId, credsA.getApiKey(), credsA.getSecret(), 0);
@@ -1064,7 +1075,10 @@ public class MexcTradeService {
                 // коротко подождём ещё раз без инкремента i
                 log.debug("A-SELL lag: inc.ask({}) > our({}) — ждём приклейки книги",
                         inc.ask().stripTrailingZeros(), price.stripTrailingZeros());
-                try { Thread.sleep(Math.min(grace, 60)); } catch (InterruptedException ignored) {}
+                try {
+                    Thread.sleep(Math.min(grace, 60));
+                } catch (InterruptedException ignored) {
+                }
                 continue;
             }
 
@@ -1082,7 +1096,7 @@ public class MexcTradeService {
                     orderId, newOrderId, inc.ask().stripTrailingZeros());
 
             orderId = newOrderId;
-            price   = newPrice;
+            price = newPrice;
             i++; // считаем только реальные перестановки
         }
         return new RequoteResult(false, "LIMIT_REACHED", orderId, price, null, null, maxRequotes);
@@ -1102,10 +1116,13 @@ public class MexcTradeService {
         final int grace = Math.max(10, postPlaceGraceMs); // короче, чем раньше
 
         for (int i = 0; i <= maxRequotes; ) {
-            try { Thread.sleep(grace); } catch (InterruptedException ignored) {}
+            try {
+                Thread.sleep(grace);
+            } catch (InterruptedException ignored) {
+            }
 
             TopOfBook inc = topIncludingSelf(symbol);
-            TopOfBook ex  = topExcludingSelf(symbol, chatId, depthLimit);
+            TopOfBook ex = topExcludingSelf(symbol, chatId, depthLimit);
 
             var st = waitUntilFilled(symbol, orderId, credsA.getApiKey(), credsA.getSecret(), 0);
             if ("FILLED".equals(st.status())) {
@@ -1124,7 +1141,10 @@ public class MexcTradeService {
             if (inc.bid().compareTo(price) < 0) {
                 log.debug("A-BUY lag: inc.bid({}) < our({}) — ждём приклейки книги",
                         inc.bid().stripTrailingZeros(), price.stripTrailingZeros());
-                try { Thread.sleep(Math.min(grace, 60)); } catch (InterruptedException ignored) {}
+                try {
+                    Thread.sleep(Math.min(grace, 60));
+                } catch (InterruptedException ignored) {
+                }
                 continue;
             }
 
@@ -1142,13 +1162,11 @@ public class MexcTradeService {
                     orderId, newOrderId, inc.bid().stripTrailingZeros());
 
             orderId = newOrderId;
-            price   = newPrice;
+            price = newPrice;
             i++;
         }
         return new RequoteResult(false, "LIMIT_REACHED", orderId, price, null, null, maxRequotes);
     }
-
-
 
 
     // --- Открытые ордера аккаунта A по символу
@@ -1386,7 +1404,9 @@ public class MexcTradeService {
         return price;
     }
 
-    public record PlacedOrder(String orderId, BigDecimal price, BigDecimal qty) {}
+    public record PlacedOrder(String orderId, BigDecimal price, BigDecimal qty) {
+    }
+
     // MexcTradeService.java — внутрь класса
     public PlacedOrder placeLimitBuyAccountAPlaced(String symbol,
                                                    BigDecimal price,
@@ -1407,7 +1427,8 @@ public class MexcTradeService {
         BigDecimal rawQty = BigDecimal.ZERO;
         try {
             rawQty = usdtAmount.divide(normPrice, 18, RoundingMode.DOWN);
-        } catch (Exception ignore) { }
+        } catch (Exception ignore) {
+        }
         BigDecimal qty = normalizeQty(rawQty, f);
 
         // ограничиваем сверху maxQty (если задан)
@@ -1503,10 +1524,10 @@ public class MexcTradeService {
 
         BigDecimal normPrice = normalizePrice(price, f);
         normPrice = guardSellPrice(symbol, normPrice);     // <— вот здесь цена может вырасти
-        BigDecimal normQty   = normalizeQty(qty, f);
+        BigDecimal normQty = normalizeQty(qty, f);
 
-        BigDecimal notional  = normPrice.multiply(normQty);
-        BigDecimal minQtyNeed= minQtyForNotional(normPrice, f.stepSize, effMinNotional);
+        BigDecimal notional = normPrice.multiply(normQty);
+        BigDecimal minQtyNeed = minQtyForNotional(normPrice, f.stepSize, effMinNotional);
         if (normQty.compareTo(minQtyNeed) < 0 || normQty.compareTo(f.minQty) < 0) {
             log.warn("SELL {}: qty {} не проходит minNotional/minQty", symbol, normQty);
             return new PlacedOrder(null, normPrice, normQty);
@@ -1667,39 +1688,38 @@ public class MexcTradeService {
     }
 
     // -- Ждём пока ордер станет финальным
-    OrderInfo waitUntilFilled(String symbol, String orderId, String apiKey, String secret, long timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        long[] sleeps = {150, 300, 600, 900, 1200};
-        int i = 0;
-        while (true) {
-            Map<String, String> q = new LinkedHashMap<>();
-            q.put("symbol", symbol);
-            q.put("orderId", orderId);
-
-            JsonNode r = signedRequest("GET", ORDER_ENDPOINT, q, apiKey, secret);
-
-            String status = r.path("status").asText("UNKNOWN");
-            BigDecimal executed = bd(r.path("executedQty").asText("0"));
-            BigDecimal cummQ = bd(r.path("cummulativeQuoteQty").asText("0"));
-            BigDecimal avg = safeAvg(cummQ, executed);
-
-            log.info("⏳ Ожидание FILLED {}#{}: status={}, executedQty={}, cummQuoteQty={}, avg={}",
-                    symbol, orderId, status, executed.toPlainString(), cummQ.toPlainString(), avg.toPlainString());
-
-            if ("FILLED".equals(status) || "CANCELED".equals(status) || "REJECTED".equals(status)) {
-                return new OrderInfo(orderId, status, executed, cummQ, avg);
-            }
-            if (System.currentTimeMillis() > deadline) {
-                log.warn("⏱ Таймаут ожидания FILLED {}#{}. Последний статус={}", symbol, orderId, status);
-                return new OrderInfo(orderId, status, executed, cummQ, avg);
-            }
-            try {
-                Thread.sleep(sleeps[Math.min(i++, sleeps.length - 1)]);
-            } catch (InterruptedException ignored) {
-            }
-        }
-    }
-
+//    OrderInfo waitUntilFilled(String symbol, String orderId, String apiKey, String secret, long timeoutMs) {
+//        long deadline = System.currentTimeMillis() + timeoutMs;
+//        long[] sleeps = {150, 300, 600, 900, 1200};
+//        int i = 0;
+//        while (true) {
+//            Map<String, String> q = new LinkedHashMap<>();
+//            q.put("symbol", symbol);
+//            q.put("orderId", orderId);
+//
+//            JsonNode r = signedRequest("GET", ORDER_ENDPOINT, q, apiKey, secret);
+//
+//            String status = r.path("status").asText("UNKNOWN");
+//            BigDecimal executed = bd(r.path("executedQty").asText("0"));
+//            BigDecimal cummQ = bd(r.path("cummulativeQuoteQty").asText("0"));
+//            BigDecimal avg = safeAvg(cummQ, executed);
+//
+//            log.info("⏳ Ожидание FILLED {}#{}: status={}, executedQty={}, cummQuoteQty={}, avg={}",
+//                    symbol, orderId, status, executed.toPlainString(), cummQ.toPlainString(), avg.toPlainString());
+//
+//            if ("FILLED".equals(status) || "CANCELED".equals(status) || "REJECTED".equals(status)) {
+//                return new OrderInfo(orderId, status, executed, cummQ, avg);
+//            }
+//            if (System.currentTimeMillis() > deadline) {
+//                log.warn("⏱ Таймаут ожидания FILLED {}#{}. Последний статус={}", symbol, orderId, status);
+//                return new OrderInfo(orderId, status, executed, cummQ, avg);
+//            }
+//            try {
+//                Thread.sleep(sleeps[Math.min(i++, sleeps.length - 1)]);
+//            } catch (InterruptedException ignored) {
+//            }
+//        }
+//    }
 
 
     // Быстрый выкуп А-SELL: LIMIT IOC BUY на аккаунте B
@@ -1710,7 +1730,7 @@ public class MexcTradeService {
         SymbolFilters f = getSymbolFilters(symbol);
         // агрессивно: на 1 тик выше нашей A-цены
         BigDecimal price = alignPriceCeil(symbol, aSellPrice.add(f.tickSize));
-        BigDecimal qty   = alignQtyFloor(symbol, requestedQty);
+        BigDecimal qty = alignQtyFloor(symbol, requestedQty);
 
         if (qty.signum() <= 0) {
             log.warn("LIMIT BUY[B][IOC]: qty<=0 (raw={}, stepSize={})", requestedQty, f.stepSize);
@@ -1723,7 +1743,7 @@ public class MexcTradeService {
             return;
         }
 
-        Map<String,String> p = new LinkedHashMap<>();
+        Map<String, String> p = new LinkedHashMap<>();
         p.put("symbol", symbol);
         p.put("side", "BUY");
         p.put("type", "LIMIT");
@@ -2065,4 +2085,93 @@ public class MexcTradeService {
         }
     }
 
+    // ws
+    public OrderInfo waitUntilFilled(String symbol, String orderId, String apiKey, String secret, long timeoutMs) {
+        // 1) Сначала пробуем «событийно» через приватный WS
+        try (var h = userDataWsManager.acquire(apiKey, secret)) {
+            var upd = userDataWsManager.awaitFinal(apiKey, orderId, java.time.Duration.ofMillis(Math.max(1500, timeoutMs)));
+            BigDecimal executed = bd(z(upd.getCumQty()));
+            BigDecimal cummQ    = bd(z(upd.getCumAmt()));
+            BigDecimal avg      = safeAvg(cummQ, executed);
+            String status = switch (upd.getStatus()) {
+                case 2 -> "FILLED";
+                case 4, 5 -> "CANCELED";
+                default -> "PARTIALLY_FILLED";
+            };
+            log.info("WS FILLED {}#{} -> status={}, exec={}, cq={}, avg={}", symbol, orderId,
+                    status, executed.toPlainString(), cummQ.toPlainString(), avg.toPlainString());
+            return new OrderInfo(orderId, status, executed, cummQ, avg);
+        } catch (Exception e) {
+            log.warn("waitUntilFilled via WS failed ({}). Fallback to REST polling…", e.getMessage());
+        }
+
+        // 2) Фолбэк — твоя текущая реализация REST-пулом (оставь как было)
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        long[] sleeps = {150, 300, 600, 900, 1200};
+        int i = 0;
+        while (true) {
+            Map<String, String> q = new LinkedHashMap<>();
+            q.put("symbol", symbol);
+            q.put("orderId", orderId);
+
+            JsonNode r = signedRequest("GET", ORDER_ENDPOINT, q, apiKey, secret);
+
+            String status = r.path("status").asText("UNKNOWN");
+            BigDecimal executed = bd(r.path("executedQty").asText("0"));
+            BigDecimal cummQ = bd(r.path("cummulativeQuoteQty").asText("0"));
+            BigDecimal avg = safeAvg(cummQ, executed);
+
+            log.info("⏳ Ожидание FILLED {}#{}: status={}, executedQty={}, cummQuoteQty={}, avg={}",
+                    symbol, orderId, status, executed.toPlainString(), cummQ.toPlainString(), avg.toPlainString());
+
+            if ("FILLED".equals(status) || "CANCELED".equals(status) || "REJECTED".equals(status)) {
+                return new OrderInfo(orderId, status, executed, cummQ, avg);
+            }
+            if (System.currentTimeMillis() > deadline) {
+                log.warn("⏱ Таймаут ожидания FILLED {}#{}. Последний статус={}", symbol, orderId, status);
+                return new OrderInfo(orderId, status, executed, cummQ, avg);
+            }
+            try {
+                Thread.sleep(sleeps[Math.min(i++, sleeps.length - 1)]);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+
+    // Старый код REST-пула перемести сюда, чтобы чётко видеть, что это фолбэк:
+    private OrderInfo waitUntilFilledRestFallback(String symbol, String orderId, String apiKey, String secret, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        long[] sleeps = {150, 300, 600, 900, 1200};
+        int i = 0;
+        while (true) {
+            Map<String, String> q = new LinkedHashMap<>();
+            q.put("symbol", symbol);
+            q.put("orderId", orderId);
+
+            JsonNode r = signedRequest("GET", ORDER_ENDPOINT, q, apiKey, secret);
+
+            String status = r.path("status").asText("UNKNOWN");
+            BigDecimal executed = bd(r.path("executedQty").asText("0"));
+            BigDecimal cummQ = bd(r.path("cummulativeQuoteQty").asText("0"));
+            BigDecimal avg = safeAvg(cummQ, executed);
+
+            if ("FILLED".equals(status) || "CANCELED".equals(status) || "REJECTED".equals(status)) {
+                return new OrderInfo(orderId, status, executed, cummQ, avg);
+            }
+            if (System.currentTimeMillis() > deadline) {
+                return new OrderInfo(orderId, status, executed, cummQ, avg);
+            }
+            try {
+                Thread.sleep(sleeps[Math.min(i++, sleeps.length - 1)]);
+            } catch (InterruptedException ignored) {
+            }
+        }
+    }
+
+    // util
+    private static String z(String s) {
+        return (s == null || s.isEmpty()) ? "0" : s;
+    }
 }

@@ -13,6 +13,19 @@ app:
     maxCycles: 100
     takerFeePct: 0.0005
     safetySpendPct: 0.998
+    ws:
+      publicUrl: "wss://wbs.mexc.com/ws"
+      userUrl: "wss://wbs-api.mexc.com/ws" # для listenKey
+      bookTickerInterval: "10ms"           # 10ms или 100ms
+      depthInterval: "10ms"                # 10ms или 100ms
+      depthLevels: 1000                    # snapshot depth (REST)
+      pingIntervalMs: 15000
+      wsPingFrameIntervalMs: 20000
+      reconnect:
+        baseDelayMs: 500
+        maxDelayMs: 10000
+      listenKey:
+        keepAliveEveryMin: 30
   drain:
     minSpreadTicks: 5
     epsilonTicks: 1
