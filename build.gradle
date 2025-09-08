@@ -2,6 +2,7 @@ plugins {
     id 'java'
     id 'org.springframework.boot' version '3.5.4'
     id 'io.spring.dependency-management' version '1.1.7'
+    id 'com.google.protobuf' version '0.9.4'
 }
 
 group = 'com.suhoi'
@@ -21,8 +22,13 @@ repositories {
 dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-web'
     implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-json'
+    implementation 'org.springframework.boot:spring-boot-starter-logging'
     implementation 'org.slf4j:slf4j-api:2.0.13'
 
+    // WebSocket клиент из JDK (java.net.http.WebSocket) — без зависимости
+    // Protobuf
+    implementation 'com.google.protobuf:protobuf-java:3.25.3'
     // Telegram long polling (стабильная ветка 6.9.x)
     implementation 'org.telegram:telegrambots:6.9.7.1'
 
@@ -36,7 +42,42 @@ dependencies {
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
+protobuf {
+    protoc { artifact = "com.google.protobuf:protoc:3.25.3" }
+    generatedFilesBaseDir = "$projectDir/build/generated"
+    plugins { /* если понадобятся */ }
+    generateProtoTasks {
+        all().each { task ->
+            task.builtins {
+                java { option 'lite' } // lite — быстрые классы
+            }
+        }
+    }
+}
+import org.gradle.api.file.DuplicatesStrategy
+import org.gradle.language.jvm.tasks.ProcessResources
 
+sourceSets {
+    main {
+        // proto остаётся только для генерации кода, НЕ как ресурсы
+        resources {
+            // вдруг кто-то положит .proto в resources — исключим
+            exclude '**/*.proto'
+        }
+        proto {
+            // структура каталогов важна
+            srcDir 'src/main/proto'
+        }
+        java {
+            srcDirs += ["$projectDir/build/generated/source/proto/main/java"]
+        }
+    }
+}
+
+tasks.withType(ProcessResources).configureEach {
+    // на всякий случай — если где-то всё же встретятся одноимённые файлы
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
 tasks.named('test') {
     useJUnitPlatform()
 }
