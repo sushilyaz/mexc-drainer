@@ -34,14 +34,14 @@ public class Reconciler {
         BigDecimal bid = top.bid();
         BigDecimal ask = top.ask();
 
-        int spreadTicks = ticksBetween(ask, bid, f.tickSize);
+        int spreadTicks = ticksBetween(ask, bid, f.getTickSize());
         if (spreadTicks < props.getDrain().getMinSpreadTicks()) {
             log.warn("Спред сжался: {} тиков (< min {}).", spreadTicks, props.getDrain().getMinSpreadTicks());
             return Verdict.AUTO_PAUSE;
         }
 
         // Наш SELL должен быть (примерно) top ask
-        int off = ticksBetween(ask, s.getPSell(), f.tickSize);
+        int off = ticksBetween(ask, s.getPSell(), f.getTickSize());
         if (off <= props.getDrain().getEpsilonTicks()) return Verdict.OK;
 
         // Кто-то вклинился между нами и нижней кромкой — переставляем.
@@ -56,7 +56,7 @@ public class Reconciler {
 
         // На B должна появиться база примерно = qtyA (допуски по stepSize).
         var f = mexc.getSymbolFilters(symbol);
-        BigDecimal step = f.stepSize;
+        BigDecimal step = f.getStepSize();
         BigDecimal dust = step.max(new BigDecimal("0.00000001"));
 
         // Если «базы» на B почти нет — кто-то другой реализовал наш SELL до того, как B купил.
@@ -75,13 +75,13 @@ public class Reconciler {
 
         BigDecimal bid = top.bid();
         BigDecimal ask = top.ask();
-        int spreadTicks = ticksBetween(ask, bid, f.tickSize);
+        int spreadTicks = ticksBetween(ask, bid, f.getTickSize());
         if (spreadTicks < props.getDrain().getMinSpreadTicks()) {
             log.warn("Спред сжался: {} тиков (< min {}).", spreadTicks, props.getDrain().getMinSpreadTicks());
             return Verdict.AUTO_PAUSE;
         }
 
-        int off = ticksBetween(s.getPBuy(), bid, f.tickSize);
+        int off = ticksBetween(s.getPBuy(), bid, f.getTickSize());
         if (off <= props.getDrain().getEpsilonTicks()) return Verdict.OK;
 
         if (s.getRequotesBuy() < props.getDrain().getMaxRequotesPerLeg()) return Verdict.NEED_REQUOTE;
@@ -98,8 +98,8 @@ public class Reconciler {
         if (bNow == null) bNow = BigDecimal.ZERO;
 
         var f = mexc.getSymbolFilters(symbol);
-        BigDecimal step = (f != null && f.stepSize != null && f.stepSize.signum() > 0)
-                ? f.stepSize
+        BigDecimal step = (f != null && f.getStepSize() != null && f.getStepSize().signum() > 0)
+                ? f.getStepSize()
                 : new BigDecimal("1"); // минимальный безопасный шаг в штуках токена, если вдруг нет фильтров
 
         // База B перед SELL с учётом хвостов прошлых циклов.

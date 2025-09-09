@@ -3,7 +3,16 @@ package com.suhoi.mexcdrainer.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.suhoi.mexcdrainer.config.AppProperties;
+import com.suhoi.mexcdrainer.config.WsMarketProperties;
+import com.suhoi.mexcdrainer.config.WsUserProperties;
 import com.suhoi.mexcdrainer.util.MemoryDb;
+import com.suhoi.mexcdrainer.ws.market.MarketWsService;
+import com.suhoi.mexcdrainer.ws.market.OrderBookRepository;
+import com.suhoi.mexcdrainer.ws.user.BalanceTracker;
+import com.suhoi.mexcdrainer.ws.user.OrderStateTracker;
+import com.suhoi.mexcdrainer.ws.user.OwnOrdersRegistry;
+import com.suhoi.mexcdrainer.ws.user.UserWsManager;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.*;
@@ -27,7 +36,14 @@ public class MexcTradeService {
 
     private static final String API_BASE = "https://api.mexc.com";
     private static final String API_PREFIX = "/api/v3";
-
+    private final OrderBookRepository obRepo;
+    private final MarketWsService marketWsService;
+    private final UserWsManager userWsManager;
+    private final OrderStateTracker orderStateTracker;
+    private final BalanceTracker balanceTracker;
+    private final OwnOrdersRegistry ownOrdersRegistry;
+    private final WsMarketProperties wsMarketProps;
+    private final WsUserProperties wsUserProps;
     private static final String ACCOUNT_ENDPOINT = API_PREFIX + "/account";
     private static final String ORDER_ENDPOINT = API_PREFIX + "/order";
     private static final String TICKER_BOOK = API_PREFIX + "/ticker/bookTicker";
@@ -44,12 +60,13 @@ public class MexcTradeService {
     private final AppProperties appProperties;
     public final Map<String, CachedSymbolInfo> exchangeInfoCache = new ConcurrentHashMap<>();
 
+    @Getter
     public static final class SymbolFilters {
-        final BigDecimal tickSize;     // PRICE_FILTER.tickSize (цена)
-        final BigDecimal stepSize;     // LOT_SIZE.stepSize (кол-во базовой)
-        final BigDecimal minQty;       // LOT_SIZE.minQty
-        final BigDecimal minNotional;  // MIN_NOTIONAL.minNotional (может быть 0 у MEXC)
-        final Integer quotePrecision;// сколько знаков разрешено у quote (USDT) для quoteOrderQty
+        private final BigDecimal tickSize;     // PRICE_FILTER.tickSize (цена)
+        private final BigDecimal stepSize;     // LOT_SIZE.stepSize (кол-во базовой)
+        private final BigDecimal minQty;       // LOT_SIZE.minQty
+        private final BigDecimal minNotional;  // MIN_NOTIONAL.minNotional (может быть 0 у MEXC)
+        private final Integer quotePrecision;  // сколько знаков разрешено у quote (USDT) для quoteOrderQty
 
         SymbolFilters(BigDecimal tickSize,
                       BigDecimal stepSize,
@@ -1531,7 +1548,7 @@ public class MexcTradeService {
     /**
      * Получить фильтры символа (с кэшем)
      */
-    SymbolFilters getSymbolFilters(String symbol) {
+    public SymbolFilters getSymbolFilters(String symbol) {
         long now = System.currentTimeMillis();
 
         CachedSymbolInfo cached = exchangeInfoCache.get(symbol);
@@ -2052,7 +2069,7 @@ public class MexcTradeService {
     /**
      * Мягкая попытка отмены спотового ордера (чтобы не словить дабл-покупку при фолбэке)
      */
-    private void tryCancelOrder(String symbol, String orderId, String apiKey, String secret) {
+    public void tryCancelOrder(String symbol, String orderId, String apiKey, String secret) {
         if (orderId == null) return;
         try {
             Map<String, String> p = new LinkedHashMap<>();

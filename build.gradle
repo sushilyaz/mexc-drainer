@@ -2,6 +2,7 @@ plugins {
     id 'java'
     id 'org.springframework.boot' version '3.5.4'
     id 'io.spring.dependency-management' version '1.1.7'
+    id 'com.google.protobuf' version '0.9.4'
 }
 
 group = 'com.suhoi'
@@ -28,7 +29,8 @@ dependencies {
 
     // JSON
     implementation 'com.fasterxml.jackson.core:jackson-databind'
-
+    // Protobuf runtime (под твои сгенерённые классы из mexcdevelop/websocket-proto)
+    implementation 'com.google.protobuf:protobuf-java:3.25.3'
     // Apache commons
     implementation 'org.apache.commons:commons-lang3:3.14.0'
     compileOnly 'org.projectlombok:lombok'
@@ -37,6 +39,24 @@ dependencies {
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
+protobuf {
+    protoc { artifact = "com.google.protobuf:protoc:3.25.3" }
+    generatedFilesBaseDir = "$projectDir/build/generated"
+    generateProtoTasks {
+        all().each { task -> task.builtins { java { option 'lite' } } }
+    }
+}
+sourceSets {
+    main {
+        java { srcDirs += ["$projectDir/build/generated/source/proto/main/java"] }
+        resources { exclude '**/*.proto' }
+        proto { srcDir 'src/main/proto' } // если вдруг положишь .proto — сгенерятся классы
+    }
+}
+tasks.withType(ProcessResources).configureEach {
+    // на всякий случай — если где-то всё же встретятся одноимённые файлы
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
 tasks.named('test') {
     useJUnitPlatform()
 }

@@ -13,6 +13,21 @@ app:
     maxCycles: 100
     takerFeePct: 0.0005
     safetySpendPct: 0.998
+    ws:
+      endpoint: wss://wbs-api.mexc.com/ws
+      pingPeriodSec: 25
+      rotateAfterHours: 23
+      reconnectBackoffBaseSec: 2
+      reconnectBackoffMaxSec: 60
+      maxSubscriptionsPerConn: 30
+      intervalMs: 100            # 10 или 100
+      partialLevels: 10          # 5/10/20
+      staleMs: 300
+      resyncBackoffMs: 200
+    user:
+      keepAliveMinutes: 30
+      awaitFilledTimeoutMs: 6000
+      balanceFreshTtlMs: 2000
   drain:
     minSpreadTicks: 5
     epsilonTicks: 1

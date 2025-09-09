@@ -10,7 +10,7 @@ public class MexcTradeServiceTest {
     private static final String API_KEY = "mx0vglKvKt55AVJwDs";
     private static final String SECRET_KEY = "2129a7877d774aeb90701ca3f6b02160";
 
-    private final MexcTradeService tradeService = new MexcTradeService();
+//    private final MexcTradeService tradeService = new MexcTradeService();
 
 //    @Test
 //    public void testMarketBuy() {
